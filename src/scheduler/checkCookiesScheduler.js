@@ -2,9 +2,9 @@ require('dotenv').config();
 const cron = require('node-cron');
 const { createClient } = require('@supabase/supabase-js');
 const fetch = require('node-fetch');
-const TelegramBot = require('node-telegram-bot-api');
 const createLogger = require('../utils/logger');
 const { withTimeout } = require('../utils/databaseUtils');
+const { bot } = require('../telegramBot');
 
 const logger = createLogger();
 
@@ -14,14 +14,12 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
-// Initialize Telegram Bot
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
-if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
-  logger.error('Missing Telegram configuration: TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set in .env');
+// Validate Telegram configuration
+const TELEGRAM_NOTIFICATION_CHAT_ID = process.env.TELEGRAM_NOTIFICATION_CHAT_ID;
+if (!TELEGRAM_NOTIFICATION_CHAT_ID) {
+  logger.error('Missing Telegram configuration: TELEGRAM_NOTIFICATION_CHAT_ID must be set in .env');
   process.exit(1);
 }
-const bot = new TelegramBot(TELEGRAM_BOT_TOKEN);
 
 // Randomize the interval between 50 and 70 minutes
 const getRandomInterval = () => {
@@ -84,7 +82,7 @@ const checkCookiesForActiveCampaigns = async () => {
 
         if (result.cookiesStatus === 'invalid') {
           const message = `⚠️ Invalid cookies detected for campaign ${campaign.id} (${campaign.name}). Please update the cookies.`;
-          await bot.sendMessage(TELEGRAM_CHAT_ID, message);
+          await bot.sendMessage(TELEGRAM_NOTIFICATION_CHAT_ID, message);
           logger.info(`Sent Telegram notification for invalid cookies in campaign ${campaign.id}`);
         }
 

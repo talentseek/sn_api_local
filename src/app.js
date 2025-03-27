@@ -2,40 +2,38 @@ require('dotenv').config();
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 const createLogger = require('./utils/logger');
+const scrapeController = require('./controllers/scrapeController');
+const scrapePremiumProfilesController = require('./controllers/scrapePremiumProfilesController');
+const checkOpenProfilesController = require('./controllers/checkOpenProfilesController');
+const checkCookiesController = require('./controllers/checkCookiesController');
+const sendConnectionRequestsController = require('./controllers/sendConnectionRequestsController');
+const { initializeBot } = require('./telegramBot'); // Import the bot initialization function
+require('./scheduler/checkCookiesScheduler'); // Import the scheduler to start it
 
-// Import the scheduler
-const { checkCookiesForActiveCampaigns } = require('./scheduler/checkCookiesScheduler');
-
+const app = express();
 const logger = createLogger();
 
+// Initialize Supabase client
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
-const router = express.Router();
+// Initialize Telegram bot with Supabase dependency
+initializeBot(supabase);
 
-// Import controllers as factory functions and pass supabase
-const scrapeController = require('./controllers/scrapeController')(supabase);
-const checkOpenProfilesController = require('./controllers/checkOpenProfilesController')(supabase);
-const scrapePremiumProfilesController = require('./controllers/scrapePremiumProfilesController')(supabase);
-const sendConnectionRequestsController = require('./controllers/sendConnectionRequestsController')(supabase);
-const checkCookiesController = require('./controllers/checkCookiesController')(supabase);
-
-// Define routes using the controller functions directly
-router.post('/scrape-profiles', scrapeController);
-router.post('/check-open-profiles', checkOpenProfilesController);
-router.post('/scrape-premium-profiles', scrapePremiumProfilesController);
-router.post('/send-connection-requests', sendConnectionRequestsController);
-router.post('/check-cookies', checkCookiesController);
-
-const app = express();
+// Middleware to parse JSON bodies
 app.use(express.json());
-app.use('/api', router);
 
+// Define routes
+app.post('/api/scrape', scrapeController(supabase));
+app.post('/api/scrape-premium-profiles', scrapePremiumProfilesController(supabase));
+app.post('/api/check-open-profiles', checkOpenProfilesController(supabase));
+app.post('/api/check-cookies', checkCookiesController(supabase));
+app.post('/api/send-connection-requests', sendConnectionRequestsController(supabase));
+
+// Start the server
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
-  logger.info(`Server running on port ${PORT}`);
+  logger.info(`Server is running on port ${PORT}`);
 });
-
-module.exports = app;
