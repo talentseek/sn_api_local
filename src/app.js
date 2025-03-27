@@ -7,8 +7,9 @@ const scrapePremiumProfilesController = require('./controllers/scrapePremiumProf
 const checkOpenProfilesController = require('./controllers/checkOpenProfilesController');
 const checkCookiesController = require('./controllers/checkCookiesController');
 const sendConnectionRequestsController = require('./controllers/sendConnectionRequestsController');
-const { initializeBot } = require('./telegramBot'); // Import the bot initialization function
-require('./scheduler/checkCookiesScheduler'); // Import the scheduler to start it
+const sendOpenProfileMessagesController = require('./controllers/sendOpenProfileMessagesController'); // Add this
+const { initializeBot } = require('./telegramBot');
+require('./scheduler/checkCookiesScheduler');
 
 const app = express();
 const logger = createLogger();
@@ -31,6 +32,7 @@ app.post('/api/scrape-premium-profiles', scrapePremiumProfilesController(supabas
 app.post('/api/check-open-profiles', checkOpenProfilesController(supabase));
 app.post('/api/check-cookies', checkCookiesController(supabase));
 app.post('/api/send-connection-requests', sendConnectionRequestsController(supabase));
+app.post('/api/send-open-profile-messages', sendOpenProfileMessagesController(supabase)); // Add this
 
 // Start the server
 const PORT = process.env.PORT || 8080;
