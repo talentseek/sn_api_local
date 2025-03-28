@@ -26,16 +26,46 @@ const withTimeout = async (promise, timeoutMs, errorMessage) => {
 
 // Factory function to initialize the bot with Supabase dependency
 const initializeBot = (supabase) => {
+  // Log all incoming messages for debugging
+  bot.on('message', (msg) => {
+    const chatId = msg.chat.id.toString();
+    const fromId = msg.from?.id || 'unknown';
+    const fromUsername = msg.from?.username || 'unknown';
+    logger.info(`Received message from chat ID ${chatId}, from user ID ${fromId} (${fromUsername}): ${msg.text}`);
+  });
+
+  // Log the Supabase instance to confirm it's passed correctly
+  logger.info(`Supabase instance in initializeBot: ${supabase ? 'defined' : 'undefined'}`);
+  if (!supabase || typeof supabase.from !== 'function') {
+    logger.error('Supabase client is not properly initialized in telegramBot.js');
+    return;
+  }
+
   // Get the bot's username dynamically to handle commands in groups
   bot.getMe().then((botInfo) => {
     const botUsername = botInfo.username;
     logger.info(`Bot username: @${botUsername}`);
 
-    // Handle /campaignstats command (with or without @BotUsername)
+    // Define the command regex with the bot's username
     const commandRegex = new RegExp(`^/campaignstats(?:@${botUsername})?(?:\\s|$)`);
+
+    // Handle /campaignstats command (with or without @BotUsername)
     bot.onText(commandRegex, async (msg) => {
       const chatId = msg.chat.id.toString();
       logger.info(`Received /campaignstats command from chat ID ${chatId}`);
+
+      // Log the msg.from value for debugging
+      const fromId = msg.from?.id || 'unknown';
+      const fromUsername = msg.from?.username || 'unknown';
+      logger.info(`Command sent by user ID ${fromId} (${fromUsername})`);
+
+      // Log the supabase instance inside the handler
+      logger.info(`Supabase instance inside /campaignstats handler: ${supabase ? 'defined' : 'undefined'}`);
+      if (!supabase || typeof supabase.from !== 'function') {
+        logger.error('Supabase client is not available in /campaignstats handler');
+        await bot.sendMessage(TELEGRAM_NOTIFICATION_CHAT_ID, '❌ Error: Supabase client not initialized. Please contact the administrator.');
+        return;
+      }
 
       // Only respond to the authorized chat ID
       if (chatId !== TELEGRAM_CHAT_ID.trim()) {
@@ -44,7 +74,8 @@ const initializeBot = (supabase) => {
       }
 
       try {
-        // Fetch all active campaigns with client_id
+        // Log before the Supabase query
+        logger.info('Attempting to fetch campaigns from Supabase...');
         const { data: campaigns, error: campaignError } = await withTimeout(
           supabase
             .from('campaigns')
@@ -54,6 +85,8 @@ const initializeBot = (supabase) => {
           'Timeout while fetching campaigns'
         );
 
+        // Log the result of the Supabase query
+        logger.info(`Supabase query result: ${campaigns ? `${campaigns.length} campaigns found` : 'No campaigns'}`);
         if (campaignError) {
           logger.error(`Failed to fetch campaigns: ${JSON.stringify(campaignError, null, 2)}`);
           await bot.sendMessage(TELEGRAM_NOTIFICATION_CHAT_ID, '❌ Error fetching campaign statistics. Please try again later.');
@@ -73,6 +106,7 @@ const initializeBot = (supabase) => {
           // Count leads available to message using client_id
           let leadsCount = 0;
           try {
+            logger.info(`Counting leads for campaign ${campaign.id} (client_id: ${campaign.client_id})...`);
             const { count, error: leadsError } = await withTimeout(
               supabase
                 .from('leads')
@@ -89,6 +123,7 @@ const initializeBot = (supabase) => {
               throw new Error(JSON.stringify(leadsError, null, 2));
             }
             leadsCount = count || 0;
+            logger.info(`Found ${leadsCount} leads for campaign ${campaign.id}`);
           } catch (error) {
             logger.error(`Failed to count leads for campaign ${campaign.id} (client_id: ${campaign.client_id}): ${error.message}`);
             campaignStats += 'Error fetching leads';
@@ -97,6 +132,7 @@ const initializeBot = (supabase) => {
           // Count premium profiles to check
           let premiumCount = 0;
           try {
+            logger.info(`Counting premium profiles for campaign ${campaign.id}...`);
             const { count, error: premiumError } = await withTimeout(
               supabase
                 .from('premium_profiles')
@@ -112,6 +148,7 @@ const initializeBot = (supabase) => {
               throw new Error(JSON.stringify(premiumError, null, 2));
             }
             premiumCount = count || 0;
+            logger.info(`Found ${premiumCount} premium profiles for campaign ${campaign.id}`);
           } catch (error) {
             logger.error(`Failed to count premium profiles for campaign ${campaign.id}: ${error.message}`);
             campaignStats += (campaignStats.endsWith(': ') ? '' : ', ') + 'Error fetching premium profiles';

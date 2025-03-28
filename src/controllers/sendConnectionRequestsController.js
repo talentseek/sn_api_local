@@ -21,8 +21,6 @@ const simulateScroll = async (page) => {
 
 module.exports = (supabase) => {
   return async (req, res) => {
-    const logger = createLogger();
-
     let jobId = null;
 
     // Function to process a single job
@@ -47,6 +45,8 @@ module.exports = (supabase) => {
         }
 
         const campaignId = jobData.campaign_id;
+        // Retrieve sendMessage from the result column
+        const sendMessage = jobData.result?.sendMessage ?? true; // Default to true if not specified
 
         const { error: updateStartError } = await withTimeout(
           supabase
@@ -68,7 +68,7 @@ module.exports = (supabase) => {
         const { data: campaignData, error: campaignError } = await withTimeout(
           supabase
             .from('campaigns')
-            .select('cookies, client_id')
+            .select('cookies, client_id, connection_messages')
             .eq('id', parseInt(campaignId))
             .single(),
           10000,
@@ -94,6 +94,30 @@ module.exports = (supabase) => {
           return;
         }
 
+        // Validate connection request message if sendMessage is true
+        let connectionRequestMessage = '';
+        if (sendMessage) {
+          connectionRequestMessage = campaignData.connection_messages?.connection_request_message?.content;
+          if (!connectionRequestMessage) {
+            const msg = `Connection request message not found in connection_messages for campaign ${campaignId}`;
+            logger.error(msg);
+            await withTimeout(
+              supabase
+                .from('jobs')
+                .update({
+                  status: 'failed',
+                  error: msg,
+                  error_category: 'invalid_connection_message',
+                  updated_at: new Date().toISOString(),
+                })
+                .eq('job_id', currentJobId),
+              10000,
+              'Timeout while updating job status'
+            );
+            return;
+          }
+        }
+
         const cookies = [
           { name: 'li_a', value: campaignData.cookies.li_a, domain: '.linkedin.com' },
           { name: 'li_at', value: campaignData.cookies.li_at, domain: '.linkedin.com' },
@@ -107,13 +131,13 @@ module.exports = (supabase) => {
 
         const { sendRequest } = sendConnectionRequestModule(page);
 
-        // Fetch profiles from scraped_profiles where connection_status is 'not sent'
+        // Fetch profiles from scraped_profiles where connection_status is 'not sent' or NULL
         const { data: profilesToConnect, error: fetchError } = await withTimeout(
           supabase
             .from('scraped_profiles')
             .select('*')
             .eq('campaign_id', campaignId)
-            .eq('connection_status', 'not sent')
+            .or('connection_status.eq.not sent,connection_status.is.null') // Fetch both 'not sent' and NULL
             .limit(jobData.max_profiles || 20),
           10000,
           'Timeout while fetching profiles from scraped_profiles'
@@ -138,14 +162,14 @@ module.exports = (supabase) => {
         }
 
         if (!profilesToConnect || profilesToConnect.length === 0) {
-          logger.info(`No profiles found in scraped_profiles for campaign ${campaignId} with connection_status 'not sent'`);
+          logger.info(`No profiles found in scraped_profiles for campaign ${campaignId} with connection_status 'not sent' or NULL`);
           await withTimeout(
             supabase
               .from('jobs')
               .update({
                 status: 'completed',
                 progress: 1,
-                result: { message: 'No profiles found to send connection requests to' },
+                result: { message: 'No profiles found to send connection requests to', sendMessage },
                 updated_at: new Date().toISOString(),
               })
               .eq('job_id', currentJobId),
@@ -169,8 +193,18 @@ module.exports = (supabase) => {
             const fullName = `${profile.first_name} ${profile.last_name}`.trim();
             logger.info(`Sending connection request to: ${fullName}`);
 
+            // Personalize the connection message if sendMessage is true
+            let personalizedMessage = '';
+            if (sendMessage) {
+              personalizedMessage = connectionRequestMessage
+                .replace('{first_name}', profile.first_name ?? 'there')
+                .replace('{last_name}', profile.last_name ?? '')
+                .replace('{job_title}', profile.job_title ?? '')
+                .replace('{company}', profile.company ?? 'your company');
+            }
+
             try {
-              await sendRequest(profile.linkedin, profile.first_name);
+              await sendRequest(profile.linkedin, personalizedMessage);
 
               // Update the profile to mark the connection_status as 'pending'
               const { error: updateError } = await withTimeout(
@@ -178,6 +212,7 @@ module.exports = (supabase) => {
                   .from('scraped_profiles')
                   .update({
                     connection_status: 'pending',
+                    error: null,
                   })
                   .eq('id', profile.id),
                 10000,
@@ -193,8 +228,15 @@ module.exports = (supabase) => {
               logger.info(`Successfully updated scraped profile ${profile.id} to connection_status 'pending'`);
             } catch (error) {
               logger.error(`Failed to send connection request to ${fullName}: ${error.message}`);
-              // Optionally, mark the profile with an error (though scraped_profiles doesn't have an error field)
-              // You could add an error field to scraped_profiles if needed
+              // Update the profile with the error
+              await withTimeout(
+                supabase
+                  .from('scraped_profiles')
+                  .update({ error: error.message })
+                  .eq('id', profile.id),
+                10000,
+                `Timeout while updating scraped profile ${profile.id} with error`
+              );
             }
 
             processedProfiles++;
@@ -238,6 +280,7 @@ module.exports = (supabase) => {
               result: {
                 totalProfilesProcessed: totalProfiles,
                 successfulRequests: successfulRequests,
+                sendMessage, // Include sendMessage in the final result
               },
               updated_at: new Date().toISOString(),
             })
@@ -286,7 +329,7 @@ module.exports = (supabase) => {
         });
       }
 
-      const { campaignId, batchSize = 5, delayBetweenBatches = 5000, delayBetweenProfiles = 5000, maxProfiles = 20 } = req.body;
+      const { campaignId, batchSize = 5, delayBetweenBatches = 5000, delayBetweenProfiles = 5000, maxProfiles = 20, sendMessage = true } = req.body;
 
       if (!campaignId) {
         logger.warn('Missing required field: campaignId');
@@ -305,7 +348,16 @@ module.exports = (supabase) => {
         });
       }
 
-      logger.info(`Received request to send connection requests for campaignId: ${campaignId}`);
+      // Validate sendMessage
+      if (typeof sendMessage !== 'boolean') {
+        logger.warn('Invalid sendMessage: must be a boolean');
+        return res.status(400).json({
+          success: false,
+          error: 'Invalid sendMessage: must be a boolean',
+        });
+      }
+
+      logger.info(`Received request to send connection requests for campaignId: ${campaignId}, sendMessage: ${sendMessage}`);
 
       const { data: jobData, error: jobError } = await withTimeout(
         supabase
@@ -315,7 +367,7 @@ module.exports = (supabase) => {
             status: 'started',
             progress: 0,
             error: null,
-            result: null,
+            result: { sendMessage }, // Store sendMessage in the result column
             campaign_id: campaignId,
             batch_size: batchSize,
             delay_between_batches: delayBetweenBatches,

@@ -117,7 +117,7 @@ const insertScrapedProfiles = async (supabase, profiles) => {
         company: profile.company,
         companylink: profile.companyLink || profile.companylink,
         connection_level: profile.connection_level,
-        connection_status: profile.connection_status || null,
+        connection_status: profile.connection_status || 'not sent', // Default to 'not sent' instead of null
         scraped_at: profile.scraped_at || new Date().toISOString(),
         created_at: new Date().toISOString(),
       });

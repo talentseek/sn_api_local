@@ -6,7 +6,7 @@ const logger = createLogger();
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 const sendConnectionRequest = (page) => {
-  const sendRequest = async (linkedinUrl, firstName) => {
+  const sendRequest = async (linkedinUrl, message) => {
     try {
       // Navigate to the lead's profile
       logger.info(`Navigating to profile: ${linkedinUrl}`);
@@ -136,7 +136,6 @@ const sendConnectionRequest = (page) => {
       logger.info(`Modal state before filling message: ${JSON.stringify(modalStateBefore)}`);
 
       // Fill in the message in the textarea
-      const message = `Hi ${firstName}, are you open to new clients?`;
       const messageTextareaSelector = 'textarea#connect-cta-form__invitation';
       await page.waitForSelector(messageTextareaSelector, { visible: true, timeout: 5000 });
       await page.type(messageTextareaSelector, message);
