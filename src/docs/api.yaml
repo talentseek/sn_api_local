@@ -1,0 +1,474 @@
+openapi: 3.0.0
+info:
+  title: LinkedIn Sales Navigator Automation API
+  description: API for automating LinkedIn Sales Navigator operations including profile scraping, connection management, and messaging.
+  version: 1.0.0
+servers:
+  - url: http://localhost:3000
+    description: Development server
+paths:
+  /api/scrape:
+    post:
+      summary: Scrape profiles from LinkedIn Sales Navigator search results
+      description: Extracts profile data from LinkedIn Sales Navigator search results and stores them in the database.
+      tags:
+        - Profile Scraping
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - campaignId
+                - searchUrl
+                - lastPage
+              properties:
+                campaignId:
+                  type: integer
+                  description: ID of the campaign to associate with scraped profiles
+                searchUrl:
+                  type: string
+                  description: LinkedIn Sales Navigator search URL
+                lastPage:
+                  type: integer
+                  description: Number of search result pages to scrape
+                batchSize:
+                  type: integer
+                  description: Number of profiles to process in each batch
+                  default: 10
+                delayBetweenBatches:
+                  type: integer
+                  description: Delay in milliseconds between batches
+                  default: 3000
+            example:
+              campaignId: 123
+              searchUrl: "https://www.linkedin.com/sales/search/people?query=(spellCorrectionEnabled:true,keywords:software%20engineer)"
+              lastPage: 5
+              batchSize: 10
+              delayBetweenBatches: 3000
+      responses:
+        '200':
+          description: Job started successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  jobId:
+                    type: string
+                    example: "12345"
+        '400':
+          description: Bad request - missing or invalid parameters
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: false
+                  error:
+                    type: string
+                    example: "Missing required field: campaignId"
+        '500':
+          description: Server error
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: false
+                  error:
+                    type: string
+                    example: "Failed to create job"
+  
+  /api/scrape-premium-profiles:
+    post:
+      summary: Scrape detailed information from premium profiles
+      description: Extracts detailed information from premium profiles in Sales Navigator.
+      tags:
+        - Profile Scraping
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - campaignId
+                - searchUrl
+              properties:
+                campaignId:
+                  type: integer
+                  description: ID of the campaign
+                searchUrl:
+                  type: string
+                  description: LinkedIn Sales Navigator search URL
+                maxPages:
+                  type: integer
+                  description: Maximum number of pages to scrape
+                  default: 5
+            example:
+              campaignId: 123
+              searchUrl: "https://www.linkedin.com/sales/search/people?query=..."
+              maxPages: 5
+      responses:
+        '200':
+          description: Job started successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/ServerError'
+  
+  /api/check-open-profiles:
+    post:
+      summary: Check which profiles allow open messaging
+      description: Identifies which profiles allow open messaging without a connection.
+      tags:
+        - Profile Management
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - campaignId
+              properties:
+                campaignId:
+                  type: integer
+                  description: ID of the campaign
+                maxProfiles:
+                  type: integer
+                  description: Maximum number of profiles to check
+                  default: 50
+                batchSize:
+                  type: integer
+                  description: Number of profiles to process in each batch
+                  default: 10
+            example:
+              campaignId: 123
+              maxProfiles: 50
+              batchSize: 10
+      responses:
+        '200':
+          description: Job started successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/ServerError'
+  
+  /api/check-cookies:
+    post:
+      summary: Verify LinkedIn cookies validity
+      description: Checks if the LinkedIn cookies for a campaign are still valid.
+      tags:
+        - Authentication
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - campaignId
+              properties:
+                campaignId:
+                  type: integer
+                  description: ID of the campaign to check cookies for
+            example:
+              campaignId: 123
+      responses:
+        '200':
+          description: Cookie check result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  cookiesStatus:
+                    type: string
+                    enum: [valid, invalid]
+                    example: "valid"
+                  message:
+                    type: string
+                    example: "LinkedIn cookies are valid"
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/ServerError'
+  
+  /api/send-connection-requests:
+    post:
+      summary: Send connection requests
+      description: Sends connection requests to specified profiles.
+      tags:
+        - Connection Management
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - campaignId
+              properties:
+                campaignId:
+                  type: integer
+                  description: ID of the campaign
+                maxProfiles:
+                  type: integer
+                  description: Maximum number of connection requests to send
+                  default: 20
+                batchSize:
+                  type: integer
+                  description: Number of requests to send in each batch
+                  default: 5
+                delayBetweenBatches:
+                  type: integer
+                  description: Delay in milliseconds between batches
+                  default: 5000
+                delayBetweenProfiles:
+                  type: integer
+                  description: Delay in milliseconds between profiles
+                  default: 5000
+                sendMessage:
+                  type: boolean
+                  description: Whether to include a message with the connection request
+                  default: true
+            example:
+              campaignId: 123
+              maxProfiles: 20
+              batchSize: 5
+              delayBetweenBatches: 5000
+              delayBetweenProfiles: 5000
+              sendMessage: true
+      responses:
+        '200':
+          description: Job started successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/ServerError'
+  
+  /api/send-open-profile-messages:
+    post:
+      summary: Send messages to open profiles
+      description: Sends messages to open profiles that don't require a connection.
+      tags:
+        - Messaging
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - campaignId
+              properties:
+                campaignId:
+                  type: integer
+                  description: ID of the campaign
+                messageStage:
+                  type: integer
+                  description: Message stage to send
+                  default: 1
+                totalMessages:
+                  type: integer
+                  description: Maximum number of messages to send
+                  default: 30
+                batchSize:
+                  type: integer
+                  description: Number of messages to send in each batch
+                  default: 5
+                delayBetweenBatches:
+                  type: integer
+                  description: Delay in milliseconds between batches
+                  default: 5000
+            example:
+              campaignId: 123
+              messageStage: 1
+              totalMessages: 30
+              batchSize: 5
+              delayBetweenBatches: 5000
+      responses:
+        '200':
+          description: Job started successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/ServerError'
+  
+  /api/check-connection-requests:
+    post:
+      summary: Check connection request status
+      description: Checks the status of previously sent connection requests.
+      tags:
+        - Connection Management
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - campaignId
+              properties:
+                campaignId:
+                  type: integer
+                  description: ID of the campaign
+                maxProfiles:
+                  type: integer
+                  description: Maximum number of connection requests to check
+                  default: 50
+                batchSize:
+                  type: integer
+                  description: Number of requests to check in each batch
+                  default: 10
+            example:
+              campaignId: 123
+              maxProfiles: 50
+              batchSize: 10
+      responses:
+        '200':
+          description: Job started successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/ServerError'
+  
+  /api/send-connection-messages:
+    post:
+      summary: Send messages to connections
+      description: Sends messages to accepted connections.
+      tags:
+        - Messaging
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - campaignId
+              properties:
+                campaignId:
+                  type: integer
+                  description: ID of the campaign
+                messageStage:
+                  type: integer
+                  description: Message stage to send
+                  default: 1
+                totalMessages:
+                  type: integer
+                  description: Maximum number of messages to send
+                  default: 30
+                batchSize:
+                  type: integer
+                  description: Number of messages to send in each batch
+                  default: 5
+                delayBetweenBatches:
+                  type: integer
+                  description: Delay in milliseconds between batches
+                  default: 5000
+            example:
+              campaignId: 123
+              messageStage: 1
+              totalMessages: 30
+              batchSize: 5
+              delayBetweenBatches: 5000
+      responses:
+        '200':
+          description: Job started successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+components:
+  schemas:
+    JobResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+          example: true
+        jobId:
+          type: string
+          example: "12345"
+    
+    ErrorResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+          example: false
+        error:
+          type: string
+          example: "Error message"
+  
+  responses:
+    BadRequest:
+      description: Bad request - missing or invalid parameters
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            success: false
+            error: "Missing required field: campaignId"
+    
+    ServerError:
+      description: Server error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            success: false
+            error: "Failed to create job"
+
+tags:
+  - name: Profile Scraping
+    description: Operations for scraping profile data from LinkedIn
+  - name: Profile Management
+    description: Operations for managing profile data
+  - name: Connection Management
+    description: Operations for managing connection requests
+  - name: Messaging
+    description: Operations for sending messages to profiles
+  - name: Authentication
+    description: Operations related to LinkedIn authentication 

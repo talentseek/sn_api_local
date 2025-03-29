@@ -19,11 +19,31 @@ const simulateScroll = async (page) => {
   });
 };
 
+/**
+ * Controller for sending connection requests to LinkedIn profiles
+ * @module controllers/sendConnectionRequestsController
+ */
+
+/**
+ * Creates a controller function for handling connection request sending
+ * @param {import('@supabase/supabase-js').SupabaseClient} supabase - Supabase client instance
+ * @returns {Function} Express route handler
+ */
 module.exports = (supabase) => {
+  /**
+   * Express route handler for sending connection requests
+   * @param {import('express').Request} req - Express request object
+   * @param {import('express').Response} res - Express response object
+   * @returns {Promise<void>}
+   */
   return async (req, res) => {
     let jobId = null;
 
-    // Function to process a single job
+    /**
+     * Processes a job to send connection requests
+     * @param {number} currentJobId - ID of the job to process
+     * @returns {Promise<void>}
+     */
     const processJob = async (currentJobId) => {
       let browser = null;
       let page = null;

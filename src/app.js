@@ -1,3 +1,7 @@
+/**
+ * Main application entry point for LinkedIn Sales Navigator Automation System
+ * @module app
+ */
 require('dotenv').config();
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
@@ -29,7 +33,10 @@ if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
   process.exit(1);
 }
 
-// Initialize Supabase client
+/**
+ * Initialize Supabase client for database operations
+ * @type {import('@supabase/supabase-js').SupabaseClient}
+ */
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 
 // Log the supabase instance to confirm it's initialized
@@ -44,14 +51,57 @@ initializeBot(supabase);
 
 app.use(express.json());
 
-// Routes
+/**
+ * API Routes for LinkedIn automation operations
+ * @see {@link ./docs/api.yaml} for OpenAPI specification
+ */
+
+/**
+ * Scrape profiles from LinkedIn Sales Navigator search results
+ * @route POST /api/scrape
+ */
 app.post('/api/scrape', scrapeController(supabase));
+
+/**
+ * Scrape detailed information from premium profiles
+ * @route POST /api/scrape-premium-profiles
+ */
 app.post('/api/scrape-premium-profiles', scrapePremiumProfilesController(supabase));
+
+/**
+ * Check which profiles allow open messaging without a connection
+ * @route POST /api/check-open-profiles
+ */
 app.post('/api/check-open-profiles', checkOpenProfilesController(supabase));
+
+/**
+ * Verify that LinkedIn cookies are still valid
+ * @route POST /api/check-cookies
+ */
 app.post('/api/check-cookies', checkCookiesController(supabase));
+
+/**
+ * Send connection requests to specified profiles
+ * @route POST /api/send-connection-requests
+ */
 app.post('/api/send-connection-requests', sendConnectionRequestsController(supabase));
+
+/**
+ * Send messages to open profiles that don't require a connection
+ * @route POST /api/send-open-profile-messages
+ */
 app.post('/api/send-open-profile-messages', sendOpenProfileMessagesController(supabase));
+
+/**
+ * Check the status of previously sent connection requests
+ * @route POST /api/check-connection-requests
+ */
 app.post('/api/check-connection-requests', checkConnectionRequestsController(supabase));
+
+/**
+ * Send messages to accepted connections
+ * @route POST /api/send-connection-messages
+ */
 app.post('/api/send-connection-messages', sendConnectionMessagesController(supabase));
 
 // Start the server
