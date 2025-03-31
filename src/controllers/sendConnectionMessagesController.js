@@ -25,6 +25,70 @@ const constructURLWithSubdomain = (lead, client, queryParam = '') => {
   return `https://default-landing-page.com${basePath}${queryParam}`;
 };
 
+/**
+ * Constructs a Cost Per Demo landing page URL
+ * @param {Object} lead - The lead object
+ * @returns {string} - The CPD landing page URL
+ */
+const constructCPDLandingPageURL = (lead) => {
+  if (!lead.first_name || !lead.last_name || !lead.company) {
+    console.warn('🚨 Missing lead details for CPD landing page:', lead);
+    return `https://costperdemo.com/landing-page/${encodeURIComponent(lead.id)}?linkedin=true`; // Fallback
+  }
+  const firstName = lead.first_name.toLowerCase();
+  const lastInitial = lead.last_name.charAt(0).toLowerCase();
+  const companySlug = lead.company.toLowerCase().replace(/[^a-z0-9]/g, '');
+  return `https://costperdemo.com/${firstName}${lastInitial}.${companySlug}`;
+};
+
+/**
+ * Personalizes a message template with lead data and custom fields
+ * @param {string} template - The message template
+ * @param {Object} lead - The lead object
+ * @param {string} landingPageURL - The landing page URL
+ * @param {string} cpdLandingPageURL - The CPD landing page URL
+ * @returns {string} - The personalized message
+ */
+const personalizeMessage = (template, lead, landingPageURL, cpdLandingPageURL) => {
+  const logger = createLogger();
+  
+  // Replace basic placeholders
+  let personalizedMessage = template
+    .replace(/{first_name}/g, lead.first_name || 'there')
+    .replace(/{last_name}/g, lead.last_name || '')
+    .replace(/{company}/g, lead.company || 'your company')
+    .replace(/{position}/g, lead.position || 'professional')
+    .replace(/{landingpage}/g, landingPageURL)
+    .replace(/{cpdlanding}/g, cpdLandingPageURL);
+  
+  // Parse personalization JSON safely
+  let customFields = {};
+  try {
+    if (typeof lead.personalization === 'string' && lead.personalization) {
+      logger.info(`Parsing personalization JSON for lead ${lead.id}: ${lead.personalization}`);
+      customFields = JSON.parse(lead.personalization);
+    } else if (typeof lead.personalization === 'object' && lead.personalization !== null) {
+      logger.info(`Using personalization object for lead ${lead.id}`);
+      customFields = lead.personalization;
+    }
+    
+    // Log the parsed custom fields
+    logger.info(`Custom fields for lead ${lead.id}: ${JSON.stringify(customFields)}`);
+  } catch (error) {
+    logger.error(`Error parsing personalization JSON for lead ${lead.id}: ${error.message}`);
+  }
+  
+  // Replace custom field placeholders using the same pattern as your working code
+  personalizedMessage = personalizedMessage.replace(/\{custom\.(.*?)\}/g, (match, key) => {
+    return customFields[key] ?? match;
+  });
+  
+  // Ensure \n renders as newlines
+  personalizedMessage = personalizedMessage.replace(/\\n/g, '\n');
+  
+  return personalizedMessage;
+};
+
 // Random delay between min and max milliseconds
 const randomDelay = (min, max) =>
   new Promise((resolve) => setTimeout(resolve, Math.floor(Math.random() * (max - min + 1)) + min));
@@ -185,7 +249,7 @@ const processJob = async (currentJobId, supabase) => {
     // Fetch leads
     let leadsQuery = supabase
       .from('leads')
-      .select('id, first_name, last_name, company, linkedin, position, client_id, message_stage, last_contacted')
+      .select('id, first_name, last_name, company, linkedin, position, client_id, message_stage, last_contacted, personalization')
       .eq('client_id', campaignData.client_id)
       .eq('connection_level', '1st') // Use connection_level instead of connection_status
       .eq('status', 'not_replied')
@@ -284,21 +348,36 @@ const processJob = async (currentJobId, supabase) => {
       for (const lead of batch) {
         logger.info(`Sending message to ${lead.first_name} at ${lead.company}`);
 
+        // Construct landing page URLs
+        const landingPageURL = constructURLWithSubdomain(lead, clientData);
+        const cpdLandingPageURL = constructCPDLandingPageURL(lead);
+        
         // Personalize the message
-        const landingPageURL = constructURLWithSubdomain(lead, clientData, '?linkedin=true');
-        let personalizedContent = messageTemplate.content
-          .replace('{first_name}', lead.first_name ?? 'there')
-          .replace('{last_name}', lead.last_name ?? '')
-          .replace('{position}', lead.position ?? '')
-          .replace('{company}', lead.company ?? 'your company')
-          .replace('{landingpage}', landingPageURL)
-          .replace(/\\n/g, '\n');
+        const personalizedMessage = personalizeMessage(
+          messageTemplate.content,
+          lead,
+          landingPageURL,
+          cpdLandingPageURL
+        );
+
+        // Add validation before sending the message
+        if (!lead.linkedin || typeof lead.linkedin !== 'string' || !lead.linkedin.includes('linkedin.com')) {
+          logger.error(`Invalid LinkedIn URL for lead ${lead.id}: ${lead.linkedin}`);
+          failedMessages.push({ leadId: lead.id, error: 'Invalid LinkedIn URL' });
+          continue; // Skip this lead
+        }
 
         try {
+          // Ensure the message content is properly formatted as a string
+          if (!personalizedMessage || typeof personalizedMessage !== 'string') {
+            logger.warn(`Invalid message format for lead ${lead.id}: ${typeof personalizedMessage}`);
+            personalizedMessage = personalizedMessage?.toString() || "Hi, I'd like to connect with you.";
+          }
+
           const result = await messageSender.sendMessage({
             leadUrl: lead.linkedin,
             message: {
-              content: personalizedContent,
+              content: personalizedMessage,
             },
           });
 
@@ -360,63 +439,31 @@ const processJob = async (currentJobId, supabase) => {
                   status: 'failed',
                   error: msg,
                   error_category: 'consecutive_failures',
-                  result: {
-                    totalMessagesRequested: totalMessages,
-                    messagesSent,
-                    failedMessages,
-                    message_stage: messageStage,
-                  },
                   updated_at: new Date().toISOString(),
                 })
                 .eq('job_id', currentJobId),
               10000,
               'Timeout while updating job status'
             );
-            return;
+            break; // Exit the loop
           }
         }
-
-        processedLeads++;
-        const progress = processedLeads / totalLeads;
-        await withTimeout(
-          supabase
-            .from('jobs')
-            .update({
-              status: 'in_progress',
-              progress,
-              updated_at: new Date().toISOString(),
-            })
-            .eq('job_id', currentJobId),
-          10000,
-          'Timeout while updating job progress'
-        );
-
-        // Small delay between messages within a batch
-        if (batch.indexOf(lead) < batch.length - 1) {
-          logger.info(`Waiting 1-2 seconds before the next message...`);
-          await randomDelay(1000, 2000);
-        }
-      }
-
-      // Delay between batches
-      if (i + batchSize < filteredLeads.length) {
-        logger.info(`Waiting 5-10 seconds before the next batch...`);
-        await randomDelay(5000, 10000);
       }
     }
 
-    logger.success(`Message sequence completed for job ${currentJobId}.`);
-    await withTimeout(
+    // Update job status
+    const { error: updateJobError } = await withTimeout(
       supabase
         .from('jobs')
         .update({
           status: 'completed',
-          progress: 1,
+          progress: messagesSent / totalLeads,
           result: {
-            totalMessagesRequested: totalMessages,
-            messagesSent,
-            failedMessages,
+            message: messagesSent > 0 ? 'Messages sent successfully' : 'No messages sent',
             message_stage: messageStage,
+            total_messages: totalLeads,
+            messages_sent: messagesSent,
+            failed_messages: failedMessages,
           },
           updated_at: new Date().toISOString(),
         })
@@ -424,109 +471,59 @@ const processJob = async (currentJobId, supabase) => {
       10000,
       'Timeout while updating job status'
     );
-  } catch (error) {
-    logger.error(`Error in job ${currentJobId}: ${error.message}`);
-    let errorCategory = 'unknown';
-    if (error.message.includes('Message button not found')) {
-      errorCategory = 'message_button_not_found';
-    } else if (error.message.includes('waitForSelector')) {
-      errorCategory = 'selector_timeout';
+
+    if (updateJobError) {
+      logger.error(`Failed to update job ${currentJobId} to completed: ${updateJobError.message}`);
     }
+  } catch (error) {
+    logger.error(`Failed to process job ${currentJobId}: ${error.message}`);
     await withTimeout(
       supabase
         .from('jobs')
         .update({
           status: 'failed',
           error: error.message,
-          error_category: errorCategory,
+          error_category: 'job_processing_failed',
           updated_at: new Date().toISOString(),
         })
         .eq('job_id', currentJobId),
       10000,
       'Timeout while updating job status'
     );
-
-    // Send Telegram notification for general failure
-    await bot.sendMessage(
-      process.env.TELEGRAM_NOTIFICATION_CHAT_ID,
-      `❌ Message sequence failed for job ${currentJobId}: ${error.message}`
-    );
-  } finally {
-    if (messageSender) {
-      await messageSender.closeBrowser();
-    }
   }
 };
 
-// Factory function pattern
 module.exports = (supabase) => {
   return async (req, res) => {
-    const logger = createLogger();
-
     let jobId = null;
-
     try {
+      // Validate request body
       if (!req.body || typeof req.body !== 'object') {
-        logger.warn('Request body is missing or invalid');
         return res.status(400).json({
           success: false,
           error: 'Request body is missing or invalid',
         });
       }
 
-      const {
-        campaignId,
-        messageStage,
-        totalMessages,
-        batchSize = 5,
-      } = req.body;
+      const { campaignId, messageStage = 1, batchSize = 10 } = req.body;
 
-      if (!campaignId || !messageStage || !totalMessages) {
-        logger.warn('Missing required fields: campaignId, messageStage, or totalMessages');
+      if (!campaignId) {
         return res.status(400).json({
           success: false,
-          error: 'Missing required fields: campaignId, messageStage, or totalMessages',
+          error: 'campaignId is required',
         });
       }
 
-      if (!Number.isInteger(messageStage) || messageStage < 1) {
-        logger.warn('Invalid messageStage: must be a positive integer');
-        return res.status(400).json({
-          success: false,
-          error: 'Invalid messageStage: must be a positive integer',
-        });
-      }
-
-      if (!Number.isInteger(totalMessages) || totalMessages < 1) {
-        logger.warn('Invalid totalMessages: must be a positive integer');
-        return res.status(400).json({
-          success: false,
-          error: 'Invalid totalMessages: must be a positive integer',
-        });
-      }
-
-      if (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > totalMessages) {
-        logger.warn('Invalid batchSize: must be a positive integer less than or equal to totalMessages');
-        return res.status(400).json({
-          success: false,
-          error: 'Invalid batchSize: must be a positive integer less than or equal to totalMessages',
-        });
-      }
-
-      logger.info(`Received request to send connection messages for campaignId: ${campaignId}, stage: ${messageStage}`);
-
-      // Create a job
+      // Create a job record
       const { data: jobData, error: jobError } = await withTimeout(
         supabase
           .from('jobs')
           .insert({
-            type: 'send_connection_messages',
             status: 'started',
-            progress: 0,
+            type: 'send_connection_messages',
             error: null,
             result: { message_stage: messageStage },
             campaign_id: campaignId.toString(),
-            max_profiles: totalMessages,
             batch_size: batchSize,
             created_at: new Date().toISOString(),
             updated_at: new Date().toISOString(),
@@ -538,22 +535,22 @@ module.exports = (supabase) => {
       );
 
       if (jobError || !jobData) {
-        logger.error(`Failed to create job: ${jobError?.message}`);
         return res.status(500).json({ success: false, error: 'Failed to create job' });
       }
 
       jobId = jobData.job_id;
-      logger.info(`Created job with ID: ${jobId} with status: started`);
-
+      
       res.json({ success: true, jobId });
 
       // Process the job asynchronously
       setImmediate(() => {
         processJob(jobId, supabase).catch((err) => {
+          const logger = createLogger();
           logger.error(`Background processing failed for job ${jobId}: ${err.message}`);
         });
       });
     } catch (error) {
+      const logger = createLogger();
       logger.error(`Error in /send-connection-messages route: ${error.message}`);
       if (jobId) {
         await withTimeout(

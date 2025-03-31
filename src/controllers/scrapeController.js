@@ -1,15 +1,31 @@
+/**
+ * Controller for scraping profiles from LinkedIn Sales Navigator
+ * @module controllers/scrapeController
+ */
+
 const createLogger = require('../utils/logger');
 const cookieLoader = require('../modules/cookieLoader');
 const zoomHandler = require('../modules/zoomHandler');
 const scraper = require('../modules/scraper');
 const { insertPremiumProfiles, insertScrapedProfiles, withTimeout } = require('../utils/databaseUtils');
+const jobQueueManager = require('../utils/jobQueueManager');
 
 const logger = createLogger();
 
+/**
+ * Creates a controller function for handling profile scraping
+ * @param {import('@supabase/supabase-js').SupabaseClient} supabase - Supabase client instance
+ * @returns {Function} Express route handler
+ */
 module.exports = (supabase) => {
+  /**
+   * Express route handler for scraping profiles
+   * @param {import('express').Request} req - Express request object
+   * @param {import('express').Response} res - Express response object
+   * @returns {Promise<void>}
+   */
   return async (req, res) => {
     const logger = createLogger();
-
     let jobId = null;
 
     try {
@@ -22,36 +38,37 @@ module.exports = (supabase) => {
         });
       }
 
-      const { campaignId, searchUrl, lastPage, batchSize, delayBetweenBatches } = req.body;
+      const { campaignId, searchUrl, lastPage = 5, batchSize = 10, delayBetweenBatches = 3000 } = req.body;
 
-      if (!campaignId || !searchUrl || !lastPage) {
-        logger.warn('Missing required fields: campaignId, searchUrl, or lastPage');
+      if (!campaignId) {
+        logger.warn('Missing required field: campaignId');
         return res.status(400).json({
           success: false,
-          error: 'Missing required fields: campaignId, searchUrl, or lastPage',
+          error: 'Missing required field: campaignId',
         });
       }
 
-      if (!Number.isInteger(Number(lastPage)) || Number(lastPage) < 1) {
-        logger.warn(`Invalid lastPage: ${lastPage}`);
+      if (!searchUrl || typeof searchUrl !== 'string' || !searchUrl.includes('linkedin.com')) {
+        logger.warn(`Invalid searchUrl: ${searchUrl}`);
         return res.status(400).json({
           success: false,
-          error: 'lastPage must be a positive integer',
+          error: 'Invalid searchUrl: must be a valid LinkedIn search URL',
         });
       }
 
-      logger.info(`Starting profile scrape for campaignId: ${campaignId}`);
+      logger.info(`Starting scrape for campaignId: ${campaignId}, searchUrl: ${searchUrl}, lastPage: ${lastPage}`);
 
-      // Create a new job entry in the jobs table
+      // Create a job entry in the database
       const { data: jobData, error: jobError } = await withTimeout(
         supabase
           .from('jobs')
           .insert({
             type: 'scrape',
-            status: 'started',
+            status: 'queued', // Changed from 'started' to 'queued'
             progress: 0,
             error: null,
             result: null,
+            campaign_id: campaignId.toString(),
             created_at: new Date().toISOString(),
             updated_at: new Date().toISOString(),
           })
@@ -67,17 +84,30 @@ module.exports = (supabase) => {
       }
 
       jobId = jobData.job_id;
-      logger.info(`Created job with ID: ${jobId}`);
+      logger.info(`Created job with ID: ${jobId} with status: queued`);
 
       // Return the job ID immediately to the client
       res.json({ success: true, jobId });
 
-      // Run the scraping task asynchronously
-      (async () => {
+      // Define the job function
+      const jobFunction = async () => {
         let browser = null;
         let page = null;
 
         try {
+          // Update job status to started
+          await withTimeout(
+            supabase
+              .from('jobs')
+              .update({
+                status: 'started',
+                updated_at: new Date().toISOString(),
+              })
+              .eq('job_id', jobId),
+            10000,
+            'Timeout while updating job status to started'
+          );
+
           // Fetch campaign data
           const { data: campaignData, error: campaignError } = await withTimeout(
             supabase
@@ -288,12 +318,10 @@ module.exports = (supabase) => {
             'Timeout while updating job status'
           );
         } catch (error) {
-          logger.error(`Error in scrapeController: ${error.message}`);
+          logger.error(`Error in job ${jobId}: ${error.message}`);
           let errorCategory = 'unknown';
           if (error.message.includes('Cookies are invalid')) {
             errorCategory = 'authentication_failed';
-          } else if (error.message.includes('Key elements not found')) {
-            errorCategory = 'page_validation_failed';
           } else if (error.message.includes('waitForSelector')) {
             errorCategory = 'selector_timeout';
           }
@@ -310,17 +338,28 @@ module.exports = (supabase) => {
             10000,
             'Timeout while updating job status'
           );
+          throw error; // Rethrow for the queue manager
         } finally {
           try {
             if (page) await page.close();
             if (browser) await browser.close();
           } catch (err) {
-            logger.error(`Failed to close browser or page: ${err.message}`);
+            logger.error(`Failed to close browser or page for job ${jobId}: ${err.message}`);
           }
         }
-      })();
+      };
+
+      // Add the job to the queue
+      jobQueueManager.addJob(jobFunction, { 
+        jobId, 
+        type: 'scrape',
+        campaignId: req.body.campaignId
+      }).catch(err => {
+        logger.error(`Queue processing failed for job ${jobId}: ${err.message}`);
+      });
+      
     } catch (error) {
-      logger.error(`Error in /scrape-profiles route: ${error.message}`);
+      logger.error(`Error in /scrape route: ${error.message}`);
       if (jobId) {
         await withTimeout(
           supabase

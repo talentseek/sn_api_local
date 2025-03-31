@@ -1,15 +1,21 @@
+/**
+ * Controller for scraping premium profiles from LinkedIn Sales Navigator
+ * @module controllers/scrapePremiumProfilesController
+ */
+
 const createLogger = require('../utils/logger');
 const cookieLoader = require('../modules/cookieLoader');
 const zoomHandler = require('../modules/zoomHandler');
 const scraperModule = require('../modules/scraper');
 const { insertPremiumProfiles, withTimeout } = require('../utils/databaseUtils');
+const jobQueueManager = require('../utils/jobQueueManager');
 
-const logger = createLogger();
-
+// Utility to generate a random delay between min and max (in milliseconds)
 const randomDelay = (min, max) => {
   return Math.floor(Math.random() * (max - min + 1)) + min;
 };
 
+// Utility to simulate scrolling
 const simulateScroll = async (page) => {
   await page.evaluate(async () => {
     window.scrollBy(0, Math.random() * 300 + 200);
@@ -17,7 +23,18 @@ const simulateScroll = async (page) => {
   });
 };
 
+/**
+ * Creates a controller function for handling premium profile scraping
+ * @param {import('@supabase/supabase-js').SupabaseClient} supabase - Supabase client instance
+ * @returns {Function} Express route handler
+ */
 module.exports = (supabase) => {
+  /**
+   * Express route handler for scraping premium profiles
+   * @param {import('express').Request} req - Express request object
+   * @param {import('express').Response} res - Express response object
+   * @returns {Promise<void>}
+   */
   return async (req, res) => {
     const logger = createLogger();
 
@@ -61,7 +78,7 @@ module.exports = (supabase) => {
           .from('jobs')
           .insert({
             type: 'scrape_premium_profiles',
-            status: 'started',
+            status: 'queued',
             progress: 0,
             error: null,
             result: null,
@@ -84,11 +101,23 @@ module.exports = (supabase) => {
 
       res.json({ success: true, jobId });
 
-      (async () => {
+      const jobFunction = async () => {
         let browser = null;
         let page = null;
 
         try {
+          await withTimeout(
+            supabase
+              .from('jobs')
+              .update({
+                status: 'started',
+                updated_at: new Date().toISOString(),
+              })
+              .eq('job_id', jobId),
+            10000,
+            'Timeout while updating job status'
+          );
+
           const { data: campaignData, error: campaignError } = await withTimeout(
             supabase
               .from('campaigns')
@@ -123,7 +152,6 @@ module.exports = (supabase) => {
             { name: 'li_at', value: campaignData.cookies.li_at, domain: '.linkedin.com' },
           ];
 
-          // Launch browser and load cookies (no proxyConfig)
           const { browser: loadedBrowser, page: loadedPage } = await cookieLoader({ cookies, searchUrl });
           browser = loadedBrowser;
           page = loadedPage;
@@ -238,7 +266,15 @@ module.exports = (supabase) => {
             logger.error(`Failed to close browser or page: ${err.message}`);
           }
         }
-      })();
+      };
+
+      jobQueueManager.addJob(jobFunction, { 
+        jobId, 
+        type: 'scrape_premium_profiles',
+        campaignId
+      }).catch(err => {
+        logger.error(`Queue processing failed for job ${jobId}: ${err.message}`);
+      });
     } catch (error) {
       logger.error(`Error in /scrape-premium-profiles route: ${error.message}`);
       if (jobId) {

@@ -16,6 +16,7 @@ const checkConnectionRequestsController = require('./controllers/checkConnection
 const sendConnectionMessagesController = require('./controllers/sendConnectionMessagesController');
 const { initializeBot } = require('./telegramBot');
 require('./scheduler/checkCookiesScheduler');
+const jobQueueManager = require('./utils/jobQueueManager');
 
 const app = express();
 const logger = createLogger();
@@ -60,7 +61,7 @@ app.use(express.json());
  * Scrape profiles from LinkedIn Sales Navigator search results
  * @route POST /api/scrape
  */
-app.post('/api/scrape', scrapeController(supabase));
+app.post('/api/scrape', scrapeController(supabase, jobQueueManager));
 
 /**
  * Scrape detailed information from premium profiles

@@ -25,6 +25,70 @@ const constructURLWithSubdomain = (lead, client, queryParam = '') => {
   return `https://default-landing-page.com${basePath}${queryParam}`;
 };
 
+/**
+ * Constructs a Cost Per Demo landing page URL
+ * @param {Object} lead - The lead object
+ * @returns {string} - The CPD landing page URL
+ */
+const constructCPDLandingPageURL = (lead) => {
+  if (!lead.first_name || !lead.last_name || !lead.company) {
+    console.warn('🚨 Missing lead details for CPD landing page:', lead);
+    return `https://costperdemo.com/landing-page/${encodeURIComponent(lead.id)}?linkedin=true`; // Fallback
+  }
+  const firstName = lead.first_name.toLowerCase();
+  const lastInitial = lead.last_name.charAt(0).toLowerCase();
+  const companySlug = lead.company.toLowerCase().replace(/[^a-z0-9]/g, '');
+  return `https://costperdemo.com/${firstName}${lastInitial}.${companySlug}`;
+};
+
+/**
+ * Personalizes a message template with lead data and custom fields
+ * @param {string} template - The message template
+ * @param {Object} lead - The lead object
+ * @param {string} landingPageURL - The landing page URL
+ * @param {string} cpdLandingPageURL - The CPD landing page URL
+ * @returns {string} - The personalized message
+ */
+const personalizeMessage = (template, lead, landingPageURL, cpdLandingPageURL) => {
+  const logger = createLogger();
+  
+  // Replace basic placeholders
+  let personalizedMessage = template
+    .replace(/{first_name}/g, lead.first_name || 'there')
+    .replace(/{last_name}/g, lead.last_name || '')
+    .replace(/{company}/g, lead.company || 'your company')
+    .replace(/{position}/g, lead.position || 'professional')
+    .replace(/{landingpage}/g, landingPageURL)
+    .replace(/{cpdlanding}/g, cpdLandingPageURL);
+  
+  // Parse personalization JSON safely
+  let customFields = {};
+  try {
+    if (typeof lead.personalization === 'string' && lead.personalization) {
+      logger.info(`Parsing personalization JSON for lead ${lead.id}: ${lead.personalization}`);
+      customFields = JSON.parse(lead.personalization);
+    } else if (typeof lead.personalization === 'object' && lead.personalization !== null) {
+      logger.info(`Using personalization object for lead ${lead.id}`);
+      customFields = lead.personalization;
+    }
+    
+    // Log the parsed custom fields
+    logger.info(`Custom fields for lead ${lead.id}: ${JSON.stringify(customFields)}`);
+  } catch (error) {
+    logger.error(`Error parsing personalization JSON for lead ${lead.id}: ${error.message}`);
+  }
+  
+  // Replace custom field placeholders using the same pattern as your working code
+  personalizedMessage = personalizedMessage.replace(/\{custom\.(.*?)\}/g, (match, key) => {
+    return customFields[key] ?? match;
+  });
+  
+  // Ensure \n renders as newlines
+  personalizedMessage = personalizedMessage.replace(/\\n/g, '\n');
+  
+  return personalizedMessage;
+};
+
 // Random delay between min and max milliseconds
 const randomDelay = (min, max) =>
   new Promise((resolve) => setTimeout(resolve, Math.floor(Math.random() * (max - min + 1)) + min));
@@ -186,7 +250,7 @@ const processJob = async (currentJobId, supabase) => {
     // Fetch leads
     let leadsQuery = supabase
       .from('leads')
-      .select('id, first_name, last_name, company, linkedin, position, client_id, message_stage, last_contacted')
+      .select('id, first_name, last_name, company, linkedin, position, client_id, message_stage, last_contacted, personalization')
       .eq('client_id', campaignData.client_id)
       .eq('is_open_profile', true)
       .eq('status', 'not_replied')
@@ -285,29 +349,29 @@ const processJob = async (currentJobId, supabase) => {
       for (const lead of batch) {
         logger.info(`Sending message to ${lead.first_name} at ${lead.company}`);
 
+        // Construct landing page URLs
+        const landingPageURL = constructURLWithSubdomain(lead, clientData);
+        const cpdLandingPageURL = constructCPDLandingPageURL(lead);
+        
         // Personalize the message
-        const landingPageURL = constructURLWithSubdomain(lead, clientData, '?linkedin=true');
-        let personalizedSubject = messageTemplate.subject
-          .replace('{first_name}', lead.first_name ?? 'there')
-          .replace('{last_name}', lead.last_name ?? '')
-          .replace('{position}', lead.position ?? '')
-          .replace('{company}', lead.company ?? 'your company')
-          .replace('{landingpage}', landingPageURL);
-
-        let personalizedContent = messageTemplate.content
-          .replace('{first_name}', lead.first_name ?? 'there')
-          .replace('{last_name}', lead.last_name ?? '')
-          .replace('{position}', lead.position ?? '')
-          .replace('{company}', lead.company ?? 'your company')
-          .replace('{landingpage}', landingPageURL)
-          .replace(/\\n/g, '\n');
-
+        const personalizedMessage = personalizeMessage(
+          messageTemplate.content,
+          lead,
+          landingPageURL,
+          cpdLandingPageURL
+        );
+        
         try {
+          // Ensure the message content is properly formatted as a string
+          if (!personalizedMessage || typeof personalizedMessage !== 'string') {
+            logger.warn(`Invalid message format for lead ${lead.id}: ${typeof personalizedMessage}`);
+            personalizedMessage = personalizedMessage?.toString() || "Hi, I'd like to connect with you.";
+          }
+
           const result = await messageSender.sendMessage({
             leadUrl: lead.linkedin,
             message: {
-              subject: personalizedSubject,
-              content: personalizedContent,
+              content: personalizedMessage,
             },
           });
 
