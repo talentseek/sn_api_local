@@ -362,29 +362,35 @@ const sendJobStatusReport = async (jobId, jobType, status, details = {}) => {
     if (details.campaignId) {
       message += `Campaign: ${details.campaignId}\n`;
     }
-    
-    if (details.message) {
-      message += `Message: ${details.message}\n`;
-    }
-    
-    if (details.totalLeads !== undefined) {
-      message += `Total leads: ${details.totalLeads}\n`;
-    }
-    
-    if (details.savedCount !== undefined) {
-      message += `Saved: ${details.savedCount}\n`;
-    }
-    
-    if (details.duplicateCount !== undefined) {
-      message += `Duplicates: ${details.duplicateCount}\n`;
-    }
-    
-    if (details.errorCount !== undefined) {
-      message += `Errors: ${details.errorCount}\n`;
-    }
-    
-    if (details.error) {
-      message += `Error: ${details.error}\n`;
+
+    // Use the summary field if available
+    if (details.summary) {
+      message += `\n${details.summary}`;
+    } else {
+      // Fallback to old format
+      if (details.message) {
+        message += `Message: ${details.message}\n`;
+      }
+      
+      if (details.totalLeads !== undefined) {
+        message += `Total leads: ${details.totalLeads}\n`;
+      }
+      
+      if (details.savedCount !== undefined) {
+        message += `Saved: ${details.savedCount}\n`;
+      }
+      
+      if (details.duplicateCount !== undefined) {
+        message += `Duplicates: ${details.duplicateCount}\n`;
+      }
+      
+      if (details.errorCount !== undefined) {
+        message += `Errors: ${details.errorCount}\n`;
+      }
+      
+      if (details.error) {
+        message += `Error: ${details.error}\n`;
+      }
     }
     
     await bot.sendMessage(process.env.TELEGRAM_NOTIFICATION_CHAT_ID, message);

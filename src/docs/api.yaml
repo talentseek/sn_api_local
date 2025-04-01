@@ -418,7 +418,21 @@ paths:
   /api/check-connection-requests:
     post:
       summary: Check connection request status
-      description: Checks the status of previously sent connection requests.
+      description: |
+        Checks the status of previously sent connection requests. Profiles are checked in priority order:
+        1. Profiles that have never been checked (last_checked is NULL)
+        2. Profiles that were checked longest ago (ordered by last_checked ascending)
+        
+        When a connection is accepted:
+        - Profile is moved to the leads table (or updated if exists)
+        - Profile status is updated to 'connected'
+        - Last checked timestamp is updated
+        
+        The system includes rate limiting:
+        - 1-2 second delay between profiles
+        - 5-10 second delay between batches
+        
+        Job status and results are reported via Telegram notifications.
       tags:
         - Connection Management
       requestBody:
@@ -436,15 +450,15 @@ paths:
                 maxProfiles:
                   type: integer
                   description: Maximum number of connection requests to check
-                  default: 50
+                  default: 20
                 batchSize:
                   type: integer
                   description: Number of requests to check in each batch
-                  default: 10
+                  default: 5
             example:
               campaignId: 123
-              maxProfiles: 50
-              batchSize: 10
+              maxProfiles: 20
+              batchSize: 5
       responses:
         '200':
           description: Job started successfully
@@ -456,6 +470,36 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '500':
           $ref: '#/components/responses/ServerError'
+      x-codeSamples:
+        - lang: curl
+          source: |
+            curl -X POST http://localhost:8080/api/check-connection-requests \
+            -H "Content-Type: application/json" \
+            -d '{
+              "campaignId": 16,
+              "maxProfiles": 20,
+              "batchSize": 5
+            }'
+      x-statusCodes:
+        - code: 200
+          description: Job successfully created and queued
+        - code: 400
+          description: Invalid request parameters
+        - code: 500
+          description: Server error occurred
+      x-telegramNotifications:
+        - type: success
+          description: |
+            Job completion notification with statistics:
+            - Total profiles checked
+            - Still pending
+            - Newly connected
+            - Moved to leads
+            - Failed checks (if any)
+        - type: error
+          description: Job failure notification with error details
+        - type: status
+          description: Status updates during processing
   
   /api/send-connection-messages:
     post:

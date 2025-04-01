@@ -1,7 +1,8 @@
 const createLogger = require('../utils/logger');
 const { withTimeout } = require('../utils/databaseUtils');
 const checkConnectionRequestsModule = require('../modules/checkConnectionRequests');
-const { bot } = require('../telegramBot');
+const { bot, sendJobStatusReport } = require('../telegramBot');
+const jobQueueManager = require('../utils/jobQueueManager');
 
 // Random delay between min and max milliseconds
 const randomDelay = (min, max) =>
@@ -88,6 +89,7 @@ const processJob = async (currentJobId, supabase) => {
         .select('*')
         .eq('campaign_id', campaignId.toString())
         .eq('connection_status', 'pending')
+        .order('last_checked', { nullsFirst: true })  // NULL values first, then oldest checked
         .limit(maxProfiles),
       10000,
       'Timeout while fetching profiles'
@@ -157,31 +159,90 @@ const processJob = async (currentJobId, supabase) => {
           if (result.status === 'accepted') {
             profilesAccepted++;
 
-            // Move the profile to the leads table
-            const { error: insertLeadError } = await withTimeout(
+            // First check if lead already exists
+            const { data: existingLead, error: checkLeadError } = await withTimeout(
               supabase
                 .from('leads')
-                .insert({
-                  client_id: campaignData.client_id,
-                  first_name: profile.first_name,
-                  last_name: profile.last_name,
-                  company: profile.company,
-                  position: profile.job_title, // Map job_title to position
-                  linkedin: profile.linkedin,
-                  companyLink: profile.companylink,
-                  connection_level: '1st', // Set to 1st since the connection was accepted
-                  is_open_profile: false,
-                  message_sent: false,
-                  message_stage: null,
-                  last_contacted: null,
-                  status: 'not_replied',
-                }),
+                .select('id')
+                .eq('client_id', campaignData.client_id)
+                .eq('linkedin', profile.linkedin)
+                .single(),
               10000,
-              `Timeout while inserting lead for profile ${profile.id}`
+              `Timeout while checking existing lead for profile ${profile.id}`
             );
 
-            if (insertLeadError) {
-              throw new Error(`Failed to insert lead for profile ${profile.id}: ${insertLeadError.message}`);
+            if (checkLeadError && !checkLeadError.message.includes('No rows found')) {
+              throw new Error(`Failed to check existing lead for profile ${profile.id}: ${checkLeadError.message}`);
+            }
+
+            if (existingLead) {
+              // Update existing lead
+              const { error: updateLeadError } = await withTimeout(
+                supabase
+                  .from('leads')
+                  .update({
+                    first_name: profile.first_name,
+                    last_name: profile.last_name,
+                    company: profile.company,
+                    position: profile.job_title,
+                    companyLink: profile.companylink,
+                    connection_level: '1st',
+                    is_open_profile: false,
+                    error: null,
+                  })
+                  .eq('id', existingLead.id),
+                10000,
+                `Timeout while updating lead ${existingLead.id}`
+              );
+
+              if (updateLeadError) {
+                throw new Error(`Failed to update lead ${existingLead.id}: ${updateLeadError.message}`);
+              }
+
+              // Make sure to update the scraped profile status to connected
+              const { error: updateProfileError } = await withTimeout(
+                supabase
+                  .from('scraped_profiles')
+                  .update({
+                    connection_status: 'connected',
+                    error: null,
+                    last_checked: new Date().toISOString(),
+                  })
+                  .eq('id', profile.id),
+                10000,
+                `Timeout while updating scraped profile ${profile.id}`
+              );
+
+              if (updateProfileError) {
+                throw new Error(`Failed to update scraped profile ${profile.id}: ${updateProfileError.message}`);
+              }
+            } else {
+              // Insert new lead
+              const { error: insertLeadError } = await withTimeout(
+                supabase
+                  .from('leads')
+                  .insert({
+                    client_id: campaignData.client_id,
+                    first_name: profile.first_name,
+                    last_name: profile.last_name,
+                    company: profile.company,
+                    position: profile.job_title,
+                    linkedin: profile.linkedin,
+                    companyLink: profile.companylink,
+                    connection_level: '1st',
+                    is_open_profile: false,
+                    message_sent: false,
+                    message_stage: null,
+                    last_contacted: null,
+                    status: 'not_replied',
+                  }),
+                10000,
+                `Timeout while inserting lead for profile ${profile.id}`
+              );
+
+              if (insertLeadError) {
+                throw new Error(`Failed to insert lead for profile ${profile.id}: ${insertLeadError.message}`);
+              }
             }
 
             profilesMovedToLeads++;
@@ -191,8 +252,9 @@ const processJob = async (currentJobId, supabase) => {
               supabase
                 .from('scraped_profiles')
                 .update({
-                  connection_status: 'connected', // Changed from 'accepted' to 'connected'
+                  connection_status: 'connected',
                   error: null,
+                  last_checked: new Date().toISOString(),
                 })
                 .eq('id', profile.id),
               10000,
@@ -203,7 +265,23 @@ const processJob = async (currentJobId, supabase) => {
               throw new Error(`Failed to update scraped profile ${profile.id}: ${updateProfileError.message}`);
             }
           } else if (result.status === 'pending') {
-            // Leave the profile unchanged
+            // Update the last_checked timestamp even for pending profiles
+            const { error: updateProfileError } = await withTimeout(
+              supabase
+                .from('scraped_profiles')
+                .update({
+                  connection_status: 'pending',
+                  error: null,
+                  last_checked: new Date().toISOString(),
+                })
+                .eq('id', profile.id),
+              10000,
+              `Timeout while updating scraped profile ${profile.id}`
+            );
+
+            if (updateProfileError) {
+              throw new Error(`Failed to update scraped profile ${profile.id}: ${updateProfileError.message}`);
+            }
             logger.info(`Connection request for ${fullName} is still pending.`);
           } else if (result.status === 'not_sent') {
             // Update the profile to allow retrying
@@ -211,8 +289,9 @@ const processJob = async (currentJobId, supabase) => {
               supabase
                 .from('scraped_profiles')
                 .update({
-                  connection_status: 'not sent', // Fixed to 'not sent'
+                  connection_status: 'not sent',
                   error: null,
+                  last_checked: new Date().toISOString(),
                 })
                 .eq('id', profile.id),
               10000,
@@ -234,7 +313,10 @@ const processJob = async (currentJobId, supabase) => {
           await withTimeout(
             supabase
               .from('scraped_profiles')
-              .update({ error: error.message })
+              .update({
+                error: error.message,
+                last_checked: new Date().toISOString(),
+              })
               .eq('id', profile.id),
             10000,
             `Timeout while updating scraped profile ${profile.id} with error`
@@ -320,7 +402,29 @@ const processJob = async (currentJobId, supabase) => {
         })
         .eq('job_id', currentJobId),
       10000,
-      'Timeout while updating job status'
+      'Timeout while updating job status to completed'
+    );
+
+    // Send success notification to Telegram
+    await sendJobStatusReport(
+      currentJobId,
+      'check_connection_requests',
+      'completed',
+      {
+        campaignId: campaignId,
+        totalProcessed: totalProfiles,
+        newConnected: profilesAccepted,
+        alreadyConnected: profilesMovedToLeads,
+        pending: totalProfiles - profilesAccepted - profilesMovedToLeads,
+        failed: failedChecks.length,
+        summary: `📊 Connection Check Results for Campaign ${campaignId}:
+• Total Profiles Checked: ${totalProfiles}
+• Still Pending: ${totalProfiles - profilesAccepted - profilesMovedToLeads}
+• Newly Connected: ${profilesAccepted}
+• Moved to Leads: ${profilesMovedToLeads}
+${failedChecks.length > 0 ? `• Failed Checks: ${failedChecks.length}
+• Failed Profiles: ${failedChecks.map(f => f.profileId).join(', ')}` : ''}`
+      }
     );
   } catch (error) {
     logger.error(`Error in job ${currentJobId}: ${error.message}`);
@@ -341,13 +445,22 @@ const processJob = async (currentJobId, supabase) => {
         })
         .eq('job_id', currentJobId),
       10000,
-      'Timeout while updating job status'
+      'Timeout while updating job status to failed'
     );
 
-    // Send Telegram notification for general failure
-    await bot.sendMessage(
-      process.env.TELEGRAM_NOTIFICATION_CHAT_ID,
-      `❌ Connection request check failed for job ${currentJobId}: ${error.message}`
+    // Send failure notification to Telegram
+    await sendJobStatusReport(
+      currentJobId,
+      'check_connection_requests',
+      'failed',
+      {
+        campaignId: parseInt(jobData?.campaign_id),
+        error: error.message,
+        summary: `❌ Connection Check Failed:
+• Campaign: ${jobData?.campaign_id}
+• Profiles Processed: ${processedProfiles || 0}
+• Error: ${error.message}`
+      }
     );
   } finally {
     if (connectionChecker) {
@@ -410,7 +523,7 @@ module.exports = (supabase) => {
           .from('jobs')
           .insert({
             type: 'check_connection_requests',
-            status: 'started',
+            status: 'queued',
             progress: 0,
             error: null,
             result: null,
@@ -432,16 +545,19 @@ module.exports = (supabase) => {
       }
 
       jobId = jobData.job_id;
-      logger.info(`Created job with ID: ${jobId} with status: started`);
+      logger.info(`Created job with ID: ${jobId} with status: queued`);
 
+      // Send immediate response
       res.json({ success: true, jobId });
 
-      // Process the job asynchronously
-      setImmediate(() => {
-        processJob(jobId, supabase).catch((err) => {
-          logger.error(`Background processing failed for job ${jobId}: ${err.message}`);
-        });
+      // Add job to queue
+      jobQueueManager.addJob(
+        () => processJob(jobId, supabase),
+        { jobId, type: 'check_connection_requests', campaignId }
+      ).catch(err => {
+        logger.error(`Queue processing failed for job ${jobId}: ${err.message}`);
       });
+
     } catch (error) {
       logger.error(`Error in /check-connection-requests route: ${error.message}`);
       if (jobId) {
