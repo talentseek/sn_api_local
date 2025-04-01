@@ -50,10 +50,32 @@ const sendConnectionRequest = (page) => {
         connectButtonSelector = `div#${ariaControls}[aria-hidden="false"] li button._item_1xnv7i`;
         connectButton = await page.evaluateHandle((selector) => {
           const buttons = Array.from(document.querySelectorAll(selector));
-          return buttons.find(button => button.textContent.trim() === 'Connect') || null;
+          // Check for both enabled and disabled buttons
+          const connectButton = buttons.find(button => {
+            const text = button.textContent.trim();
+            // Skip buttons that are already pending
+            if (text.includes('Pending') || text.includes('pending')) return false;
+            return text === 'Connect';
+          });
+          return connectButton || null;
         }, connectButtonSelector);
 
         if (!connectButton) {
+          // Check if the button exists but is disabled with "Pending" status
+          const pendingStatus = await page.evaluate((selector) => {
+            const buttons = Array.from(document.querySelectorAll(selector));
+            const pendingButton = buttons.find(button => {
+              const text = button.textContent.trim();
+              return text.includes('Pending') || text.includes('pending');
+            });
+            return pendingButton ? 'pending' : null;
+          }, connectButtonSelector);
+
+          if (pendingStatus === 'pending') {
+            logger.info('Connection request is already pending');
+            return { success: true, status: 'pending' };
+          }
+
           logger.warn('Connect button not found in the overflow menu. Attempting to find standard LinkedIn profile URL...');
 
           // Try to extract the standard LinkedIn profile URL from the "View LinkedIn profile" link
@@ -122,21 +144,74 @@ const sendConnectionRequest = (page) => {
         logger.info('Clicked the "Connect" button using evaluate method');
       }
 
-      // Wait for the connection request modal to appear
+      // Wait for the connection request modal to appear with increased timeout and better error handling
       const modalSelector = 'div.artdeco-modal-overlay';
-      await page.waitForSelector(`${modalSelector}[aria-hidden="false"]`, { visible: true, timeout: 10000 });
-      logger.info('Connection request modal appeared');
+      try {
+        // First try to wait for the modal to be visible
+        await page.waitForSelector(modalSelector, { visible: true, timeout: 15000 });
+        
+        // Then wait for it to be fully loaded and interactive
+        await page.waitForFunction(
+          (selector) => {
+            const modal = document.querySelector(selector);
+            return modal && !modal.offsetParent && modal.getAttribute('aria-hidden') === 'false';
+          },
+          { timeout: 15000 },
+          modalSelector
+        );
+        
+        logger.info('Connection request modal appeared and is interactive');
+      } catch (error) {
+        logger.error(`Modal did not appear after clicking Connect: ${error.message}`);
+        
+        // Check if the connection request was already sent
+        const connectionStatus = await page.evaluate(() => {
+          const buttons = Array.from(document.querySelectorAll('button'));
+          const buttonTexts = buttons.map(button => button.textContent.trim());
+          
+          if (buttonTexts.some(text => text.includes('Connect -- pending'))) return 'pending';
+          if (buttonTexts.some(text => text.includes('Pending'))) return 'pending';
+          if (buttonTexts.some(text => text.includes('Message sent'))) return 'pending';
+          if (buttonTexts.some(text => text.includes('Message'))) return 'pending';
+          if (buttonTexts.some(text => text.includes('Connected'))) return 'connected';
+          if (buttonTexts.some(text => text.includes('Following'))) return 'following';
+          
+          return 'not_connected';
+        });
 
-      // Log the modal's state before proceeding
-      const modalStateBefore = await page.evaluate((selector) => {
-        const modal = document.querySelector(selector);
-        return modal ? { ariaHidden: modal.getAttribute('aria-hidden'), isVisible: !modal.offsetParent } : null;
-      }, modalSelector);
-      logger.info(`Modal state before filling message: ${JSON.stringify(modalStateBefore)}`);
+        if (connectionStatus !== 'not_connected') {
+          logger.info(`Lead is already ${connectionStatus}`);
+          return { success: true, status: connectionStatus };
+        }
+
+        throw new Error('Failed to open connection request modal');
+      }
+
+      // Add a delay to ensure the modal is fully loaded
+      await delay(2000);
+
+      // Check if we need to click "Add a note" first
+      const addNoteButtonSelector = 'button[aria-label="Add a note"]';
+      const addNoteButton = await page.$(addNoteButtonSelector);
+      if (addNoteButton) {
+        logger.info('Found "Add a note" button, clicking it');
+        await addNoteButton.click();
+        await delay(1000);
+      }
 
       // Fill in the message in the textarea
       const messageTextareaSelector = 'textarea#connect-cta-form__invitation';
       await page.waitForSelector(messageTextareaSelector, { visible: true, timeout: 5000 });
+      
+      // Clear any existing text first
+      await page.evaluate((selector) => {
+        const textarea = document.querySelector(selector);
+        if (textarea) {
+          textarea.value = '';
+          textarea.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+      }, messageTextareaSelector);
+      
       await page.type(messageTextareaSelector, message);
       logger.info(`Added message to connection request: ${message}`);
 
@@ -158,11 +233,19 @@ const sendConnectionRequest = (page) => {
         throw new Error('"Send Invitation" button not found on the page');
       }
 
+      // Click the button and wait for any animations
       await page.evaluate((selector) => {
         const button = document.querySelector(selector);
-        if (button) button.click();
+        if (button) {
+          button.click();
+          return true;
+        }
+        return false;
       }, sendButtonSelector);
       logger.info('Clicked the "Send Invitation" button');
+
+      // Add a delay after clicking
+      await delay(2000);
 
       // Check for error messages or CAPTCHAs
       const errorMessage = await page.evaluate(() => {
@@ -178,28 +261,108 @@ const sendConnectionRequest = (page) => {
         throw new Error('CAPTCHA detected after clicking "Send Invitation". Manual intervention required.');
       }
 
-      // Log the modal's state after clicking "Send Invitation"
-      const modalStateAfter = await page.evaluate((selector) => {
-        const modal = document.querySelector(selector);
-        return modal ? { ariaHidden: modal.getAttribute('aria-hidden'), isVisible: !modal.offsetParent } : null;
-      }, modalSelector);
-      logger.info(`Modal state after clicking "Send Invitation": ${JSON.stringify(modalStateAfter)}`);
-
-      // Log the page content for debugging
-      const pageContent = await page.evaluate(() => document.body.innerHTML);
-      logger.info(`Page content after clicking "Send Invitation":\n${pageContent}`);
-
       // Wait for the modal to close or the "Connect -- pending" status to appear
-      await Promise.race([
-        page.waitForSelector(modalSelector, { hidden: true, timeout: 20000 }),
-        page.waitForSelector('button:has-text("Connect -- pending")', { visible: true, timeout: 20000 }),
-      ]);
+      try {
+        await Promise.race([
+          page.waitForSelector(modalSelector, { hidden: true, timeout: 20000 }),
+          page.waitForFunction(() => {
+            const buttons = Array.from(document.querySelectorAll('button'));
+            return buttons.some(button => 
+              button.textContent.includes('Connect -- pending') || 
+              button.textContent.includes('Pending') ||
+              button.textContent.includes('Message sent')
+            );
+          }, { timeout: 20000 })
+        ]);
+      } catch (error) {
+        logger.warn('Timeout waiting for modal to close or status to change. Checking current state...');
+        
+        // Check if the connection request was already sent
+        const connectionStatus = await page.evaluate(() => {
+          const buttons = Array.from(document.querySelectorAll('button'));
+          const buttonTexts = buttons.map(button => button.textContent.trim());
+          
+          if (buttonTexts.some(text => text.includes('Connect -- pending'))) return 'pending';
+          if (buttonTexts.some(text => text.includes('Pending'))) return 'pending';
+          if (buttonTexts.some(text => text.includes('Message sent'))) return 'pending';
+          if (buttonTexts.some(text => text.includes('Message'))) return 'pending';
+          if (buttonTexts.some(text => text.includes('Connected'))) return 'connected';
+          if (buttonTexts.some(text => text.includes('Following'))) return 'following';
+          
+          return 'not_connected';
+        });
+
+        if (connectionStatus !== 'not_connected') {
+          logger.info(`Lead is already ${connectionStatus}`);
+          return { success: true, status: connectionStatus };
+        }
+
+        // Check if the modal is still visible
+        const isModalVisible = await page.evaluate((selector) => {
+          const modal = document.querySelector(selector);
+          return modal && !modal.offsetParent;
+        }, modalSelector);
+        
+        if (isModalVisible) {
+          // Try clicking the send button again
+          logger.info('Modal still visible, attempting to click send button again');
+          await page.evaluate((selector) => {
+            const button = document.querySelector(selector);
+            if (button) {
+              button.click();
+              return true;
+            }
+            return false;
+          }, sendButtonSelector);
+          await delay(2000);
+          
+          // Check if the modal is now hidden
+          const isModalStillVisible = await page.evaluate((selector) => {
+            const modal = document.querySelector(selector);
+            return modal && !modal.offsetParent;
+          }, modalSelector);
+          
+          if (isModalStillVisible) {
+            throw new Error('Modal still visible after second attempt to send invitation');
+          }
+        }
+      }
+
+      // Add a delay to allow the UI to update
+      await delay(2000);
+
+      // Verify the connection request was sent by checking for various success states
+      const requestStatus = await page.evaluate(() => {
+        const buttons = Array.from(document.querySelectorAll('button'));
+        const buttonTexts = buttons.map(button => button.textContent.trim());
+        
+        // Check for various success states
+        if (buttonTexts.some(text => text.includes('Connect -- pending'))) return 'pending';
+        if (buttonTexts.some(text => text.includes('Pending'))) return 'pending';
+        if (buttonTexts.some(text => text.includes('Message sent'))) return 'sent';
+        if (buttonTexts.some(text => text.includes('Message'))) return 'sent';
+        
+        // Check if the modal is gone
+        const modal = document.querySelector('div.artdeco-modal-overlay');
+        if (!modal || modal.offsetParent === null) return 'modal_closed';
+        
+        return 'unknown';
+      });
+
+      logger.info(`Connection request status: ${requestStatus}`);
+      
+      if (requestStatus === 'unknown') {
+        // Take a screenshot for debugging
+        await page.screenshot({ path: 'connection-request-error.png' });
+        throw new Error('Could not verify connection request was sent successfully');
+      }
+
       logger.success(`Successfully sent connection request to ${linkedinUrl}${standardProfileUrl ? ` (via standard profile: ${standardProfileUrl})` : ''}`);
 
-      return true;
+      return { success: true, status: requestStatus };
     } catch (error) {
       logger.error(`Failed to send connection request to ${linkedinUrl}: ${error.message}`);
-      throw error;
+      return { success: false, error: error.message };
     }
   };
 

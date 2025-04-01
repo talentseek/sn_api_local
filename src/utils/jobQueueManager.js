@@ -19,7 +19,7 @@ class JobQueueManager {
    */
   constructor() {
     this.queue = [];
-    this.isProcessing = false;
+    this.processing = false;
     this.activeJob = null; // Track only the currently active job
     this.logger = createLogger();
     this.logger.info('Job Queue Manager initialized');
@@ -46,7 +46,7 @@ class JobQueueManager {
     
     return new Promise((resolve, reject) => {
       // Check if a job is currently running
-      if (this.isProcessing) {
+      if (this.processing) {
         this.logger.info(`Job ${jobId} of type ${type} added to queue. Queue length: ${this.queue.length + 1}`);
         this.queue.push({
           jobFunction,
@@ -73,12 +73,12 @@ class JobQueueManager {
    */
   async processNextJob() {
     if (this.queue.length === 0) {
-      this.isProcessing = false;
+      this.processing = false;
       this.activeJob = null;
       return;
     }
 
-    this.isProcessing = true;
+    this.processing = true;
     const { jobFunction, metadata, resolve, reject } = this.queue.shift();
     const { jobId, type, campaignId } = metadata;
     
@@ -105,9 +105,21 @@ class JobQueueManager {
   getQueueStatus() {
     return {
       queueLength: this.queue.length,
-      isProcessing: this.isProcessing,
+      isProcessing: this.processing,
       activeJob: this.activeJob
     };
+  }
+
+  isProcessing() {
+    return this.processing;
+  }
+
+  getQueueLength() {
+    return this.queue.length;
+  }
+
+  getActiveJob() {
+    return this.activeJob;
   }
 }
 

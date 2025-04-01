@@ -62,7 +62,7 @@ app.use(express.json());
 const scrapePremiumProfilesController = scrapePremiumProfilesControllerFactory(supabase);
 const checkOpenProfilesController = checkOpenProfilesControllerFactory(supabase); // Assuming direct export - VERIFY
 const checkCookiesController = checkCookiesControllerFactory(supabase); // Assuming direct export - VERIFY
-const sendConnectionRequestsController = sendConnectionRequestsControllerFactory(supabase); // Assuming direct export - VERIFY
+const sendConnectionRequestsController = sendConnectionRequestsControllerFactory(supabase); // Initialize once
 const sendOpenProfileMessagesController = sendOpenProfileMessagesControllerFactory(supabase); // Assuming direct export - VERIFY
 const checkConnectionRequestsController = checkConnectionRequestsControllerFactory(supabase); // Assuming direct export - VERIFY
 const sendConnectionMessagesController = sendConnectionMessagesControllerFactory(supabase); // Assuming direct export - VERIFY
@@ -106,7 +106,7 @@ app.post('/api/check-cookies', checkCookiesController);
  * Send connection requests to specified profiles
  * @route POST /api/send-connection-requests
  */
-app.post('/api/send-connection-requests', sendConnectionRequestsController);
+app.post('/api/send-connection-requests', sendConnectionRequestsController); // Use the initialized controller
 
 /**
  * Send messages to open profiles that don't require a connection

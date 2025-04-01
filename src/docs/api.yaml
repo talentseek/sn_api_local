@@ -245,7 +245,12 @@ paths:
   /api/send-connection-requests:
     post:
       summary: Send connection requests
-      description: Sends connection requests to specified profiles.
+      description: |
+        Sends connection requests to LinkedIn profiles with personalized messages.
+        The system processes profiles in batches with configurable delays to prevent rate limiting.
+        Each request can include a personalized message using profile data placeholders.
+        The system handles various scenarios including pending requests, already connected profiles, and failed attempts.
+        Job status and statistics are reported via Telegram notifications.
       tags:
         - Connection Management
       requestBody:
@@ -278,7 +283,7 @@ paths:
                   default: 5000
                 sendMessage:
                   type: boolean
-                  description: Whether to include a message with the connection request
+                  description: Whether to include a personalized message with the connection request
                   default: true
             example:
               campaignId: 123
@@ -293,11 +298,70 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/JobResponse'
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  message:
+                    type: string
+                    example: "Connection requests job accepted and queued"
+                  jobId:
+                    type: string
+                    example: "connect_1234567890"
         '400':
-          $ref: '#/components/responses/BadRequest'
+          description: Bad request - missing or invalid parameters
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: false
+                  error:
+                    type: string
+                    example: "campaignId is required"
         '500':
-          $ref: '#/components/responses/ServerError'
+          description: Server error
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: false
+                  error:
+                    type: string
+                    example: "Failed to fetch campaign data"
+      x-codeSamples:
+        - lang: curl
+          source: |
+            curl -X POST http://localhost:8080/api/send-connection-requests \
+            -H "Content-Type: application/json" \
+            -d '{
+              "campaignId": 123,
+              "maxProfiles": 20,
+              "batchSize": 5,
+              "delayBetweenBatches": 5000,
+              "delayBetweenProfiles": 5000,
+              "sendMessage": true
+            }'
+      x-statusCodes:
+        - code: 200
+          description: Job successfully created and queued
+        - code: 400
+          description: Invalid request parameters
+        - code: 500
+          description: Server error occurred
+      x-telegramNotifications:
+        - type: success
+          description: Job completion notification with statistics
+        - type: error
+          description: Job failure notification with error details
+        - type: status
+          description: Status update during processing
   
   /api/send-open-profile-messages:
     post:

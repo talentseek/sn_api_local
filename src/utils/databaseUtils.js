@@ -277,10 +277,60 @@ const insertPremiumProfiles = async (supabase, profiles) => {
   return profilesToInsert.length;
 };
 
+/**
+ * Gets scraped profiles from the database for a specific campaign
+ * @param {import('@supabase/supabase-js').SupabaseClient} supabase - Supabase client instance
+ * @param {number} campaignId - The ID of the campaign
+ * @param {number} maxProfiles - Maximum number of profiles to fetch
+ * @returns {Promise<Array>} Array of scraped profiles
+ */
+const getScrapedProfiles = async (supabase, campaignId, maxProfiles = 20) => {
+  const { data: profiles, error } = await withTimeout(
+    supabase
+      .from('scraped_profiles')
+      .select('*')
+      .eq('campaign_id', campaignId.toString())
+      .eq('connection_status', 'not sent')
+      .limit(maxProfiles),
+    10000,
+    'Timeout while fetching scraped profiles'
+  );
+
+  if (error) {
+    throw new Error(`Failed to fetch scraped profiles: ${error.message}`);
+  }
+
+  return profiles || [];
+};
+
+/**
+ * Updates the connection status of a scraped profile
+ * @param {import('@supabase/supabase-js').SupabaseClient} supabase - Supabase client instance
+ * @param {number} profileId - The ID of the profile to update
+ * @param {string} status - The new connection status
+ * @returns {Promise<void>}
+ */
+const updateScrapedProfile = async (supabase, profileId, status) => {
+  const { error } = await withTimeout(
+    supabase
+      .from('scraped_profiles')
+      .update({ connection_status: status })
+      .eq('id', profileId),
+    10000,
+    'Timeout while updating scraped profile'
+  );
+
+  if (error) {
+    throw new Error(`Failed to update scraped profile: ${error.message}`);
+  }
+};
+
 module.exports = {
   insertLeads,
   insertScrapedProfiles,
   insertPremiumProfiles,
   withTimeout,
   normalizeLinkedInUrl,
+  getScrapedProfiles,
+  updateScrapedProfile
 };

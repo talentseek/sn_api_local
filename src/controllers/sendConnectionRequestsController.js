@@ -2,10 +2,11 @@ const createLogger = require('../utils/logger');
 const cookieLoader = require('../modules/cookieLoader');
 const zoomHandler = require('../modules/zoomHandler');
 const sendConnectionRequestModule = require('../modules/sendConnectionRequest');
-const { withTimeout } = require('../utils/databaseUtils');
+const { withTimeout, getScrapedProfiles, updateScrapedProfile } = require('../utils/databaseUtils');
 const jobQueueManager = require('../utils/jobQueueManager');
 const puppeteer = require('puppeteer');
-const { bot } = require('../telegramBot');
+const { bot, sendJobStatusReport } = require('../telegramBot');
+const { personalizeMessage } = require('../utils/messageUtils');
 
 const logger = createLogger();
 
@@ -32,428 +33,263 @@ const simulateScroll = async (page) => {
  * @param {import('@supabase/supabase-js').SupabaseClient} supabase - Supabase client instance
  * @returns {Function} Express route handler
  */
-module.exports = (supabase) => {
-  /**
-   * Express route handler for sending connection requests
-   * @param {import('express').Request} req - Express request object
-   * @param {import('express').Response} res - Express response object
-   * @returns {Promise<void>}
-   */
+const sendConnectionRequestsController = (supabase) => {
   return async (req, res) => {
-    let jobId = null;
-
     try {
       // Validate request body
-      if (!req.body || typeof req.body !== 'object') {
-        logger.warn('Request body is missing or invalid');
+      if (!req.body) {
         return res.status(400).json({
           success: false,
-          error: 'Request body is missing or invalid',
+          error: 'Request body is required'
         });
       }
 
-      // Extract and validate parameters
       const { 
         campaignId, 
+        maxProfiles = 20, 
         batchSize = 5, 
         delayBetweenBatches = 5000, 
-        delayBetweenProfiles = 2000,
-        maxProfiles = 100,
-        note = ''
+        delayBetweenProfiles = 5000, 
+        sendMessage = true 
       } = req.body;
 
+      // Validate required fields
       if (!campaignId) {
-        logger.warn('Missing required field: campaignId');
         return res.status(400).json({
           success: false,
-          error: 'Missing required field: campaignId',
+          error: 'campaignId is required'
         });
       }
 
-      // Create a job record
-      const { data: jobData, error: jobError } = await withTimeout(
+      // Fetch campaign data to get connection message template
+      const { data: campaignData, error: campaignError } = await withTimeout(
         supabase
-          .from('jobs')
-          .insert({
-            type: 'send_connection_requests',
-            status: 'queued', // Changed from 'started' to 'queued'
-            campaign_id: campaignId,
-            batch_size: batchSize,
-            delay_between_batches: delayBetweenBatches,
-            delay_between_profiles: delayBetweenProfiles,
-            max_profiles: maxProfiles,
-            created_at: new Date().toISOString(),
-            updated_at: new Date().toISOString(),
-          })
-          .select()
+          .from('campaigns')
+          .select('connection_messages')
+          .eq('id', campaignId)
           .single(),
         10000,
-        'Timeout while creating job record'
+        'Timeout while fetching campaign data'
       );
 
-      if (jobError) {
-        logger.error(`Failed to create job record: ${jobError.message}`);
-        return res.status(500).json({
-          success: false,
-          error: `Failed to create job record: ${jobError.message}`,
-        });
+      if (campaignError) {
+        logger.error(`Error fetching campaign data: ${campaignError.message}`);
+        return res.status(500).json({ success: false, error: 'Failed to fetch campaign data' });
       }
 
-      jobId = jobData.job_id;
-      logger.info(`Created job with ID: ${jobId} with status: ${jobData.status}`);
+      // If sendMessage is true, validate that we have a template
+      if (sendMessage && (!campaignData?.connection_messages?.connection_request_message?.content)) {
+        logger.warn(`Campaign ${campaignId} has no connection message template. Proceeding without message.`);
+        // Don't return error, just continue without message
+      }
 
-      // Return success response with job ID
-      res.json({ success: true, jobId });
-
-      // Define the job function
+      // Create a job function that will be executed by the queue
       const jobFunction = async () => {
-        let browser = null;
-        let page = null;
-
+        const browser = await puppeteer.launch({
+          headless: true,
+          args: ['--start-maximized']
+        });
+        const page = await browser.newPage();
+        
+        // Initialize counters outside try block so they're accessible in catch
+        let processedCount = 0;
+        let sentCount = 0;
+        let pendingCount = 0;
+        let connectedCount = 0;
+        let followingCount = 0;
+        let failedCount = 0;
+        
         try {
-          // Update job status to started
-          await withTimeout(
-            supabase
-              .from('jobs')
-              .update({
-                status: 'started',
-                updated_at: new Date().toISOString(),
-              })
-              .eq('job_id', jobId),
-            10000,
-            'Timeout while updating job status to started'
-          );
-
-          const { data: jobData, error: jobFetchError } = await withTimeout(
-            supabase
-              .from('jobs')
-              .select('*')
-              .eq('job_id', jobId)
-              .single(),
-            10000,
-            'Timeout while fetching job data'
-          );
-
-          if (jobFetchError || !jobData) {
-            logger.error(`Failed to fetch job ${jobId}: ${jobFetchError?.message}`);
-            return;
+          // Set up the page with necessary configurations
+          await page.setViewport({ width: 1280, height: 800 });
+          await page.setUserAgent('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
+          
+          // Load cookies from database
+          const { cookies, error: cookieError } = await cookieLoader(supabase, { campaignId });
+          if (cookieError || !cookies) {
+            throw new Error(`Failed to load LinkedIn cookies: ${cookieError || 'No valid cookies found'}`);
           }
 
-          const campaignId = jobData.campaign_id;
-          // Retrieve sendMessage from the result column
-          const sendMessage = jobData.result?.sendMessage ?? true; // Default to true if not specified
+          // Set LinkedIn cookies
+          await page.setCookie(
+            { name: 'li_at', value: cookies.li_at, domain: '.linkedin.com' },
+            { name: 'JSESSIONID', value: cookies.li_a, domain: '.linkedin.com' }
+          );
 
+          // Get profiles to process
+          const profiles = await getScrapedProfiles(supabase, campaignId, maxProfiles);
+          if (!profiles || profiles.length === 0) {
+            throw new Error('No profiles found to process');
+          }
+
+          // Fetch campaign data to get connection message template
           const { data: campaignData, error: campaignError } = await withTimeout(
             supabase
               .from('campaigns')
-              .select('cookies, client_id, connection_messages')
-              .eq('id', parseInt(campaignId))
+              .select('connection_messages')
+              .eq('id', campaignId)
               .single(),
             10000,
             'Timeout while fetching campaign data'
           );
 
-          if (campaignError || !campaignData?.cookies || campaignData.client_id == null) {
-            const msg = `Could not load campaign data (cookies or client_id) for campaign ${campaignId}`;
-            logger.error(msg);
-            await withTimeout(
-              supabase
-                .from('jobs')
-                .update({
-                  status: 'failed',
-                  error: msg,
-                  error_category: 'campaign_load_failed',
-                  updated_at: new Date().toISOString(),
-                })
-                .eq('job_id', jobId),
-              10000,
-              'Timeout while updating job status'
-            );
-            return;
+          if (campaignError || !campaignData?.connection_messages?.connection_request_message?.content) {
+            throw new Error(`Failed to load connection message template: ${campaignError?.message || 'No template found'}`);
           }
 
-          // Validate connection request message if sendMessage is true
-          let connectionRequestMessage = '';
-          if (sendMessage) {
-            connectionRequestMessage = campaignData.connection_messages?.connection_request_message?.content;
-            if (!connectionRequestMessage) {
-              const msg = `Connection request message not found in connection_messages for campaign ${campaignId}`;
-              logger.error(msg);
-              await withTimeout(
-                supabase
-                  .from('jobs')
-                  .update({
-                    status: 'failed',
-                    error: msg,
-                    error_category: 'invalid_connection_message',
-                    updated_at: new Date().toISOString(),
-                  })
-                  .eq('job_id', jobId),
-                10000,
-                'Timeout while updating job status'
-              );
-              return;
-            }
-          }
+          const messageTemplate = campaignData.connection_messages.connection_request_message.content;
 
-          const { cookies, error: cookieError } = await cookieLoader(supabase, { campaignId });
-          if (cookieError || !cookies) {
-            const msg = `Failed to load LinkedIn cookies: ${cookieError || 'No valid cookies found'}`;
-            logger.error(msg);
-            await withTimeout(
-              supabase
-                .from('jobs')
-                .update({
-                  status: 'failed',
-                  error: msg,
-                  error_category: 'cookie_load_failed',
-                  updated_at: new Date().toISOString(),
-                })
-                .eq('job_id', jobId),
-              10000,
-              'Timeout while updating job status'
-            );
-            return;
-          }
-
-          // Initialize browser
-          browser = await puppeteer.launch({
-            headless: true,
-            args: ['--start-maximized'],
-          });
-
-          page = await browser.newPage();
-          await page.setViewport({ width: 1280, height: 800 });
-
-          // Set LinkedIn cookies
-          await page.setCookie(
-            { name: 'li_at', value: cookies.li_at, domain: '.linkedin.com' },
-            { name: 'li_a', value: cookies.li_a, domain: '.linkedin.com' }
-          );
-
-          await zoomHandler(page);
-
+          // Initialize the connection request module
           const { sendRequest } = sendConnectionRequestModule(page);
 
-          // Fetch profiles from scraped_profiles where connection_status is 'not sent' or NULL
-          const { data: profilesToConnect, error: fetchError } = await withTimeout(
-            supabase
-              .from('scraped_profiles')
-              .select('*')
-              .eq('campaign_id', campaignId)
-              .or('connection_status.eq.not sent,connection_status.is.null') // Fetch both 'not sent' and NULL
-              .limit(jobData.max_profiles || 20),
-            10000,
-            'Timeout while fetching profiles from scraped_profiles'
-          );
+          // Process profiles in batches
+          const totalProfiles = profiles.length;
 
-          if (fetchError) {
-            logger.error(`Failed to fetch profiles from scraped_profiles: ${fetchError.message}`);
-            await withTimeout(
-              supabase
-                .from('jobs')
-                .update({
-                  status: 'failed',
-                  error: fetchError.message,
-                  error_category: 'database_fetch_failed',
-                  updated_at: new Date().toISOString(),
-                })
-                .eq('job_id', jobId),
-              10000,
-              'Timeout while updating job status'
-            );
-            return;
-          }
-
-          if (!profilesToConnect || profilesToConnect.length === 0) {
-            logger.info(`No profiles found in scraped_profiles for campaign ${campaignId} with connection_status 'not sent' or NULL`);
-            await withTimeout(
-              supabase
-                .from('jobs')
-                .update({
-                  status: 'completed',
-                  progress: 1,
-                  result: { message: 'No profiles found to send connection requests to', sendMessage },
-                  updated_at: new Date().toISOString(),
-                })
-                .eq('job_id', jobId),
-              10000,
-              'Timeout while updating job status'
-            );
-            return;
-          }
-
-          logger.info(`Found ${profilesToConnect.length} profiles to send connection requests to`);
-
-          const totalProfiles = profilesToConnect.length;
-          let processedProfiles = 0;
-          let successfulRequests = 0;
-
-          for (let i = 0; i < profilesToConnect.length; i += (jobData.batch_size || 5)) {
-            const batch = profilesToConnect.slice(i, i + (jobData.batch_size || 5));
-            logger.info(`Processing batch ${Math.floor(i / (jobData.batch_size || 5)) + 1} (${batch.length} profiles)`);
-
+          for (let i = 0; i < totalProfiles; i += batchSize) {
+            const batch = profiles.slice(i, i + batchSize);
+            
+            // Process each profile in the batch
             for (const profile of batch) {
-              const fullName = `${profile.first_name} ${profile.last_name}`.trim();
-              logger.info(`Sending connection request to: ${fullName}`);
-
-              // Personalize the connection message if sendMessage is true
-              let personalizedMessage = '';
-              if (sendMessage) {
-                personalizedMessage = connectionRequestMessage
-                  .replace('{first_name}', profile.first_name ?? 'there')
-                  .replace('{last_name}', profile.last_name ?? '')
-                  .replace('{job_title}', profile.job_title ?? '')
-                  .replace('{company}', profile.company ?? 'your company');
-              }
-
               try {
-                await sendRequest(profile.linkedin, personalizedMessage);
-
-                // Update the profile to mark the connection_status as 'pending'
-                const { error: updateError } = await withTimeout(
-                  supabase
-                    .from('scraped_profiles')
-                    .update({
-                      connection_status: 'pending',
-                      error: null,
-                    })
-                    .eq('id', profile.id),
-                  10000,
-                  'Timeout while updating scraped_profiles'
-                );
-
-                if (updateError) {
-                  logger.error(`Failed to update scraped profile ${profile.id}: ${updateError.message}`);
-                  throw new Error(`Failed to update scraped profile ${profile.id}: ${updateError.message}`);
+                // Validate profile URL
+                if (!profile.linkedin) {
+                  logger.error(`Profile ${profile.id} has no LinkedIn URL`);
+                  failedCount++;
+                  processedCount++;
+                  continue;
                 }
 
-                successfulRequests++;
-                logger.info(`Successfully updated scraped profile ${profile.id} to connection_status 'pending'`);
+                // Personalize the message
+                let personalizedMessage = messageTemplate;
+                if (sendMessage) {
+                  personalizedMessage = personalizeMessage(
+                    messageTemplate,
+                    {
+                      first_name: profile.first_name,
+                      last_name: profile.last_name,
+                      company: profile.company,
+                      job_title: profile.job_title,
+                      linkedin: profile.linkedin
+                    },
+                    null, // No landing page URL needed for connection requests
+                    null  // No CPD landing page URL needed for connection requests
+                  );
+                }
+
+                const result = await sendRequest(profile.linkedin, personalizedMessage);
+                
+                if (result.success) {
+                  if (result.status === 'pending') pendingCount++;
+                  else if (result.status === 'connected') connectedCount++;
+                  else if (result.status === 'following') followingCount++;
+                  else sentCount++;
+                } else {
+                  failedCount++;
+                }
+
+                // Update profile status in database - only use allowed values
+                const dbStatus = result.success ? 
+                  (result.status === 'pending' ? 'pending' : 
+                   result.status === 'connected' ? 'connected' : 'not sent') : 
+                  'not sent';
+
+                await updateScrapedProfile(supabase, profile.id, dbStatus);
+
+                processedCount++;
+                await new Promise(resolve => setTimeout(resolve, delayBetweenProfiles));
               } catch (error) {
-                logger.error(`Failed to send connection request to ${fullName}: ${error.message}`);
-                // Update the profile with the error
-                await withTimeout(
-                  supabase
-                    .from('scraped_profiles')
-                    .update({ error: error.message })
-                    .eq('id', profile.id),
-                  10000,
-                  `Timeout while updating scraped profile ${profile.id} with error`
-                );
-              }
-
-              processedProfiles++;
-              const progress = processedProfiles / totalProfiles;
-              await withTimeout(
-                supabase
-                  .from('jobs')
-                  .update({
-                    status: 'in_progress',
-                    progress,
-                    updated_at: new Date().toISOString(),
-                  })
-                  .eq('job_id', jobId),
-                10000,
-                'Timeout while updating job progress'
-              );
-
-              if (processedProfiles < totalProfiles && batch.indexOf(profile) < batch.length - 1) {
-                const delay = randomDelay((jobData.delay_between_profiles || 5000) - 500, (jobData.delay_between_profiles || 5000) + 500);
-                logger.info(`Waiting ${delay}ms before processing next profile`);
-                await new Promise(resolve => setTimeout(resolve, delay));
-                await simulateScroll(page);
+                failedCount++;
+                processedCount++;
+                logger.error(`Error processing profile ${profile.linkedin}: ${error.message}`);
               }
             }
 
-            if (i + (jobData.batch_size || 5) < profilesToConnect.length) {
-              const delay = randomDelay((jobData.delay_between_batches || 5000) - 1000, (jobData.delay_between_batches || 5000) + 1000);
-              logger.info(`Waiting ${delay}ms before processing next batch`);
-              await new Promise(resolve => setTimeout(resolve, delay));
-              await simulateScroll(page);
+            // Wait between batches
+            if (i + batchSize < totalProfiles) {
+              await new Promise(resolve => setTimeout(resolve, delayBetweenBatches));
             }
           }
 
-          logger.success(`Connection requests sending completed for job ${jobId}.`);
-          await withTimeout(
-            supabase
-              .from('jobs')
-              .update({
-                status: 'completed',
-                progress: 1,
-                result: {
-                  totalProfilesProcessed: totalProfiles,
-                  successfulRequests: successfulRequests,
-                  sendMessage, // Include sendMessage in the final result
-                },
-                updated_at: new Date().toISOString(),
-              })
-              .eq('job_id', jobId),
-            10000,
-            'Timeout while updating job status'
+          // Send job completion report
+          const message = `Connection requests completed for campaign ${campaignId}:\n` +
+            `✅ Total Processed: ${processedCount}\n` +
+            `📤 New Sent: ${sentCount}\n` +
+            `⏳ Already Pending: ${pendingCount}\n` +
+            `✅ Already Connected: ${connectedCount}\n` +
+            `👥 Following: ${followingCount}\n` +
+            `❌ Failed: ${failedCount}`;
+
+          await sendJobStatusReport(
+            job.id,
+            'connect',
+            'completed',
+            {
+              campaignId,
+              message,
+              savedCount: sentCount,
+              totalScraped: processedCount,
+              totalValid: processedCount - failedCount
+            }
           );
+
+          logger.success(`Connection requests sending completed for job ${job.id}.`);
+          return { success: true };
         } catch (error) {
-          logger.error(`Error in job ${jobId}: ${error.message}`);
-          let errorCategory = 'unknown';
-          if (error.message.includes('Cookies are invalid')) {
-            errorCategory = 'authentication_failed';
-          } else if (error.message.includes('waitForSelector')) {
-            errorCategory = 'selector_timeout';
-          }
-          await withTimeout(
-            supabase
-              .from('jobs')
-              .update({
-                status: 'failed',
-                error: error.message,
-                error_category: errorCategory,
-                updated_at: new Date().toISOString(),
-              })
-              .eq('job_id', jobId),
-            10000,
-            'Timeout while updating job status'
+          logger.error(`Error processing connection requests job ${job.id}: ${error.message}`);
+          
+          // Send error notification
+          await sendJobStatusReport(
+            job.id,
+            'connect',
+            'failed',
+            {
+              campaignId,
+              message: `❌ Connection requests failed for campaign ${campaignId}:\n${error.message}`,
+              savedCount: sentCount,
+              totalScraped: processedCount,
+              totalValid: processedCount - failedCount,
+              error: error.message
+            }
           );
+
+          throw error;
         } finally {
-          try {
-            if (page) await page.close();
-            if (browser) await browser.close();
-          } catch (err) {
-            logger.error(`Failed to close browser or page: ${err.message}`);
-          }
+          await page.close();
+          await browser.close();
         }
       };
 
-      // Add the job to the queue (NOT bypassing the queue)
-      jobQueueManager.addJob(
-        jobFunction, 
-        { 
-          jobId, 
-          type: 'send_connection_requests',
-          campaignId
-        },
-        false // Make sure we're NOT bypassing the queue
-      ).catch(err => {
-        logger.error(`Connection request job failed for job ${jobId}: ${err.message}`);
+      // Create the job object
+      const job = {
+        id: `connect_${Date.now()}`,
+        type: 'connect',
+        campaignId,
+        maxProfiles,
+        batchSize,
+        delayBetweenBatches,
+        delayBetweenProfiles,
+        sendMessage,
+        supabase
+      };
+
+      // Send immediate response
+      res.json({
+        success: true,
+        message: 'Connection requests job accepted and queued',
+        jobId: job.id
       });
-      
+
+      // Add the job to the queue after sending response
+      await jobQueueManager.addJob(jobFunction, job);
+
     } catch (error) {
-      logger.error(`Error in /send-connection-requests route: ${error.message}`);
-      if (jobId) {
-        await withTimeout(
-          supabase
-            .from('jobs')
-            .update({
-              status: 'failed',
-              error: error.message,
-              error_category: 'request_validation_failed',
-              updated_at: new Date().toISOString(),
-            })
-            .eq('job_id', jobId),
-          10000,
-          'Timeout while updating job status'
-        );
+      logger.error(`Error in sendConnectionRequestsController: ${error.message}`);
+      // Only send response if headers haven't been sent yet
+      if (!res.headersSent) {
+        res.status(500).json({ success: false, error: error.message });
       }
-      return res.status(500).json({ success: false, error: error.message });
     }
   };
 };
+
+module.exports = sendConnectionRequestsController;
