@@ -4,6 +4,7 @@
  */
 
 const createLogger = require('./logger');
+const debugJobs = process.env.DEBUG_JOBS === 'true';
 
 /**
  * Manages a queue of jobs to be processed sequentially
@@ -18,6 +19,9 @@ class JobQueueManager {
     this.isProcessing = false;
     this.logger = createLogger();
     this.logger.info('Job Queue Manager initialized');
+
+    // Add a lock mechanism to prevent duplicate job execution
+    this.jobLocks = new Map();
   }
 
   /**
@@ -32,6 +36,22 @@ class JobQueueManager {
     const jobId = jobData.jobId || `job_${Date.now()}`;
     
     this.logger.info(`Adding job to queue: ${jobId} (${jobType}), bypassQueue: ${bypassQueue}`);
+    
+    if (debugJobs) {
+      this.logger.debug(`Job Queue State before adding ${jobId}:`);
+      this.logger.debug(`- isProcessing: ${this.isProcessing}`);
+      this.logger.debug(`- Queue length: ${this.queue.length}`);
+      this.logger.debug(`- Active locks: ${Array.from(this.jobLocks.keys()).join(', ')}`);
+    }
+    
+    // Check if this job is already being processed
+    if (this.jobLocks.has(jobId)) {
+      this.logger.warn(`Job ${jobId} (${jobType}) is already being processed. Skipping duplicate execution.`);
+      return;
+    }
+    
+    // Set a lock for this job
+    this.jobLocks.set(jobId, true);
     
     return new Promise((resolve, reject) => {
       const job = {
@@ -104,6 +124,17 @@ class JobQueueManager {
     } catch (error) {
       this.logger.error(`Job ${job.id} (${job.type}) failed: ${error.message}`);
       job.reject(error);
+    } finally {
+      // Wait a bit before processing the next job to ensure clean state
+      setTimeout(() => {
+        this.logger.info(`Job ${job.id} (${job.type}) processing completed. Setting isProcessing to false.`);
+        this.isProcessing = false;
+        
+        // Release the lock
+        this.jobLocks.delete(job.id);
+        
+        this.processNextJob();
+      }, 2000);
     }
   }
 }

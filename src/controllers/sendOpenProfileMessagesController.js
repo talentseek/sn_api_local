@@ -354,25 +354,33 @@ const processJob = async (currentJobId, supabase) => {
         const cpdLandingPageURL = constructCPDLandingPageURL(lead);
         
         // Personalize the message
-        const personalizedMessage = personalizeMessage(
-          messageTemplate.content,
-          lead,
-          landingPageURL,
-          cpdLandingPageURL
-        );
+        let personalizedMessage;
+        try {
+          personalizedMessage = personalizeMessage(
+            messageTemplate.content,
+            lead,
+            landingPageURL,
+            cpdLandingPageURL
+          );
+          
+          // Validate the personalized message
+          if (typeof personalizedMessage !== 'string' || personalizedMessage.trim() === '') {
+            throw new Error('Personalized message is empty or invalid');
+          }
+          
+          logger.info(`Personalized message (first 50 chars): ${personalizedMessage.substring(0, 50)}...`);
+        } catch (error) {
+          throw new Error(`Failed to personalize message: ${error.message}`);
+        }
         
         try {
-          // Ensure the message content is properly formatted as a string
-          if (!personalizedMessage || typeof personalizedMessage !== 'string') {
-            logger.warn(`Invalid message format for lead ${lead.id}: ${typeof personalizedMessage}`);
-            personalizedMessage = personalizedMessage?.toString() || "Hi, I'd like to connect with you.";
-          }
-
           const result = await messageSender.sendMessage({
             leadUrl: lead.linkedin,
             message: {
-              content: personalizedMessage,
+              content: personalizedMessage
             },
+            subject: messageTemplate.subject || '{company} Financial Forecasting',
+            lead: lead
           });
 
           if (result.success) {

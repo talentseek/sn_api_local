@@ -9,6 +9,8 @@ const zoomHandler = require('../modules/zoomHandler');
 const scraperModule = require('../modules/scraper');
 const { insertPremiumProfiles, withTimeout } = require('../utils/databaseUtils');
 const jobQueueManager = require('../utils/jobQueueManager');
+const puppeteer = require('puppeteer');
+const { bot } = require('../telegramBot');
 
 // Utility to generate a random delay between min and max (in milliseconds)
 const randomDelay = (min, max) => {
@@ -118,18 +120,9 @@ module.exports = (supabase) => {
             'Timeout while updating job status'
           );
 
-          const { data: campaignData, error: campaignError } = await withTimeout(
-            supabase
-              .from('campaigns')
-              .select('cookies')
-              .eq('id', parseInt(campaignId))
-              .single(),
-            10000,
-            'Timeout while fetching campaign data'
-          );
-
-          if (campaignError || !campaignData?.cookies) {
-            const msg = `Could not load campaign cookies for campaign ${campaignId}`;
+          const { cookies, error: cookieError } = await cookieLoader(supabase, { campaignId });
+          if (cookieError || !cookies) {
+            const msg = `Failed to load LinkedIn cookies: ${cookieError || 'No valid cookies found'}`;
             logger.error(msg);
             await withTimeout(
               supabase
@@ -137,7 +130,7 @@ module.exports = (supabase) => {
                 .update({
                   status: 'failed',
                   error: msg,
-                  error_category: 'campaign_load_failed',
+                  error_category: 'cookie_load_failed',
                   updated_at: new Date().toISOString(),
                 })
                 .eq('job_id', jobId),
@@ -147,14 +140,21 @@ module.exports = (supabase) => {
             return;
           }
 
-          const cookies = [
-            { name: 'li_a', value: campaignData.cookies.li_a, domain: '.linkedin.com' },
-            { name: 'li_at', value: campaignData.cookies.li_at, domain: '.linkedin.com' },
-          ];
+          // Initialize browser
+          browser = await puppeteer.launch({
+            headless: true,
+            args: ['--start-maximized'],
+          });
 
-          const { browser: loadedBrowser, page: loadedPage } = await cookieLoader({ cookies, searchUrl });
-          browser = loadedBrowser;
-          page = loadedPage;
+          page = await browser.newPage();
+          await page.setViewport({ width: 1280, height: 800 });
+
+          // Set LinkedIn cookies
+          await page.setCookie(
+            { name: 'li_at', value: cookies.li_at, domain: '.linkedin.com' },
+            { name: 'li_a', value: cookies.li_a, domain: '.linkedin.com' }
+          );
+
           await zoomHandler(page);
 
           const { scrapePage } = scraperModule(page, totalPages, searchUrl);
@@ -237,6 +237,18 @@ module.exports = (supabase) => {
             10000,
             'Timeout while updating job status'
           );
+
+          // Send notification to Telegram
+          try {
+            const successMessage = `✅ Premium profile scraping completed for campaign ${campaignId}:\n` +
+              `- Total profiles found: ${allPremiumProfiles.length}\n` +
+              `- Pages scraped: ${currentPage - 1}/${totalPages}`;
+            
+            await bot.sendMessage(process.env.TELEGRAM_NOTIFICATION_CHAT_ID, successMessage);
+            logger.info('Sent completion notification to Telegram');
+          } catch (telegramError) {
+            logger.error(`Failed to send Telegram notification: ${telegramError.message}`);
+          }
         } catch (error) {
           logger.error(`Error in scrapePremiumProfilesController: ${error.message}`);
           let errorCategory = 'unknown';

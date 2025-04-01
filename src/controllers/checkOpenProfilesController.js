@@ -4,6 +4,8 @@ const zoomHandler = require('../modules/zoomHandler');
 const openProfilesModule = require('../modules/openProfiles');
 const { insertLeads, insertScrapedProfiles, withTimeout } = require('../utils/databaseUtils');
 const jobQueueManager = require('../utils/jobQueueManager');
+const puppeteer = require('puppeteer');
+const { bot } = require('../telegramBot');
 
 const logger = createLogger();
 
@@ -148,20 +150,41 @@ module.exports = (supabase) => {
             return;
           }
 
-          const cookies = [
-            { name: 'li_a', value: campaignData.cookies.li_a, domain: '.linkedin.com' },
-            { name: 'li_at', value: campaignData.cookies.li_at, domain: '.linkedin.com' },
-          ];
+          const { cookies, error: cookieError } = await cookieLoader(supabase, { campaignId });
+          if (cookieError || !cookies) {
+            const msg = `Failed to load LinkedIn cookies: ${cookieError || 'No valid cookies found'}`;
+            logger.error(msg);
+            await withTimeout(
+              supabase
+                .from('jobs')
+                .update({
+                  status: 'failed',
+                  error: msg,
+                  error_category: 'cookie_load_failed',
+                  updated_at: new Date().toISOString(),
+                })
+                .eq('job_id', jobId),
+              10000,
+              'Timeout while updating job status'
+            );
+            return;
+          }
 
-          const clientId = campaignData.client_id;
-
-          // Launch browser and load cookies
-          const { browser: loadedBrowser, page: loadedPage } = await cookieLoader({ 
-            cookies, 
-            searchUrl: 'https://www.linkedin.com/sales/home' 
+          // Initialize browser
+          browser = await puppeteer.launch({
+            headless: true,
+            args: ['--start-maximized'],
           });
-          browser = loadedBrowser;
-          page = loadedPage;
+
+          page = await browser.newPage();
+          await page.setViewport({ width: 1280, height: 800 });
+
+          // Set LinkedIn cookies
+          await page.setCookie(
+            { name: 'li_at', value: cookies.li_at, domain: '.linkedin.com' },
+            { name: 'li_a', value: cookies.li_a, domain: '.linkedin.com' }
+          );
+
           await zoomHandler(page);
 
           const { checkOpenProfile } = openProfilesModule(page);
@@ -310,7 +333,7 @@ module.exports = (supabase) => {
 
           // Process open profiles
           if (openProfiles.length > 0) {
-            totalMovedToLeads = await insertLeads(supabase, openProfiles, clientId);
+            totalMovedToLeads = await insertLeads(supabase, openProfiles, campaignData.client_id);
 
             const openProfileIds = openProfiles.map(profile => profile.id);
             const { error: updateLeadsError } = await withTimeout(
@@ -402,17 +425,13 @@ module.exports = (supabase) => {
         }
       };
 
-      // Add the job to the queue (NOT bypassing the queue)
-      jobQueueManager.addJob(
-        jobFunction, 
-        { 
-          jobId, 
-          type: 'check_open_profiles',
-          campaignId
-        },
-        false // Make sure we're NOT bypassing the queue
-      ).catch(err => {
-        logger.error(`Open profile check failed for job ${jobId}: ${err.message}`);
+      // Instead of immediately executing the job function
+      jobQueueManager.addJob(() => jobFunction(), { 
+        jobId, 
+        type: 'check_open_profiles',
+        campaignId: req.body.campaignId
+      }).catch(err => {
+        logger.error(`Queue processing failed for job ${jobId}: ${err.message}`);
       });
       
     } catch (error) {

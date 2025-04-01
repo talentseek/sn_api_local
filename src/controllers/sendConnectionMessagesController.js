@@ -475,6 +475,19 @@ const processJob = async (currentJobId, supabase) => {
     if (updateJobError) {
       logger.error(`Failed to update job ${currentJobId} to completed: ${updateJobError.message}`);
     }
+
+    // Send notification to Telegram
+    try {
+      const successMessage = `✅ Connection messages sent for campaign ${campaignId}:\n` +
+        `- Leads processed: ${processedLeads}\n` +
+        `- Messages sent: ${messagesSent}\n` +
+        `- Failed messages: ${failedMessages}`;
+      
+      await bot.sendMessage(process.env.TELEGRAM_NOTIFICATION_CHAT_ID, successMessage);
+      logger.info('Sent completion notification to Telegram');
+    } catch (telegramError) {
+      logger.error(`Failed to send Telegram notification: ${telegramError.message}`);
+    }
   } catch (error) {
     logger.error(`Failed to process job ${currentJobId}: ${error.message}`);
     await withTimeout(

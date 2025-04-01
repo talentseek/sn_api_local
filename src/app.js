@@ -17,6 +17,7 @@ const sendConnectionMessagesController = require('./controllers/sendConnectionMe
 const { initializeBot } = require('./telegramBot');
 require('./scheduler/checkCookiesScheduler');
 const jobQueueManager = require('./utils/jobQueueManager');
+const scrapeCompanyDataController = require('./controllers/scrapeCompanyDataController');
 
 const app = express();
 const logger = createLogger();
@@ -104,6 +105,12 @@ app.post('/api/check-connection-requests', checkConnectionRequestsController(sup
  * @route POST /api/send-connection-messages
  */
 app.post('/api/send-connection-messages', sendConnectionMessagesController(supabase));
+
+/**
+ * Scrape company data from LinkedIn
+ * @route POST /api/scrape-company-data
+ */
+app.post('/api/scrape-company-data', scrapeCompanyDataController(supabase));
 
 // Start the server
 const PORT = process.env.PORT || 3000;
