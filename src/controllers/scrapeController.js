@@ -1,381 +1,256 @@
 /**
- * Controller for scraping profiles from LinkedIn Sales Navigator
+ * Controller for scraping LinkedIn Sales Navigator search results
  * @module controllers/scrapeController
  */
-
+const { v4: uuidv4 } = require('uuid');
 const createLogger = require('../utils/logger');
+const scraperModule = require('../modules/scraper'); // Use the simplified scraper
 const cookieLoader = require('../modules/cookieLoader');
-const zoomHandler = require('../modules/zoomHandler');
-const scraper = require('../modules/scraper');
-const { insertPremiumProfiles, insertScrapedProfiles, withTimeout } = require('../utils/databaseUtils');
+const { insertScrapedProfiles, withTimeout } = require('../utils/databaseUtils'); // Use the existing insert function
 const jobQueueManager = require('../utils/jobQueueManager');
+const { sendJobStatusReport } = require('../telegramBot');
 
-const logger = createLogger();
+// Process the job asynchronously
+const processJob = async (currentJobId, supabase, jobParams) => {
+  const logger = createLogger();
+  const scraperInstance = scraperModule(); // Create an instance of the simplified scraper
+  let jobStatus = 'failed'; // Default to failed
+  let jobResult = null;
+  let errorCategory = 'unknown';
+  let errorMessage = '';
+  let totalScraped = 0;
+  let totalValid = 0;
+  let totalInserted = 0;
+  const { lastPage, searchUrl } = jobParams || {}; // Use default empty object to avoid errors if jobParams is undefined
 
-/**
- * Creates a controller function for handling profile scraping
- * @param {import('@supabase/supabase-js').SupabaseClient} supabase - Supabase client instance
- * @returns {Function} Express route handler
- */
-module.exports = (supabase) => {
-  /**
-   * Express route handler for scraping profiles
-   * @param {import('express').Request} req - Express request object
-   * @param {import('express').Response} res - Express response object
-   * @returns {Promise<void>}
-   */
-  return async (req, res) => {
-    const logger = createLogger();
-    let jobId = null;
+  try {
+    logger.info(`Processing scrape job ${currentJobId}...`);
 
-    try {
-      // Safely access req.body
-      if (!req.body || typeof req.body !== 'object') {
-        logger.warn('Request body is missing or invalid');
-        return res.status(400).json({
-          success: false,
-          error: 'Request body is missing or invalid',
-        });
-      }
+    // 1. Fetch Job Details (we still need campaign_id from here)
+    const { data: jobData, error: jobFetchError } = await withTimeout(
+      supabase.from('jobs').select('campaign_id').eq('job_id', currentJobId).single(), // Only select necessary fields
+      10000, 'Timeout fetching job data'
+    );
 
-      const { campaignId, searchUrl, lastPage = 5, batchSize = 10, delayBetweenBatches = 3000 } = req.body;
+    if (jobFetchError || !jobData) {
+      errorMessage = `Failed to fetch job ${currentJobId}: ${jobFetchError?.message || 'Not found'}`;
+      errorCategory = 'job_fetch_failed';
+      logger.error(errorMessage);
+      // No need to update job here, finally block will handle it if jobData is null
+      return; // Exit early
+    }
 
-      if (!campaignId) {
-        logger.warn('Missing required field: campaignId');
-        return res.status(400).json({
-          success: false,
-          error: 'Missing required field: campaignId',
-        });
-      }
+    const { campaign_id } = jobData; // Only get campaign_id from jobData
+    const campaignId = parseInt(campaign_id); // Ensure campaignId is a number
 
-      if (!searchUrl || typeof searchUrl !== 'string' || !searchUrl.includes('linkedin.com')) {
-        logger.warn(`Invalid searchUrl: ${searchUrl}`);
-        return res.status(400).json({
-          success: false,
-          error: 'Invalid searchUrl: must be a valid LinkedIn search URL',
-        });
-      }
+    if (!campaignId || !searchUrl || !lastPage) {
+        errorMessage = `Job ${currentJobId} is missing required parameters: campaignId=${campaignId}, searchUrl=${searchUrl}, lastPage=${lastPage}.`;
+        errorCategory = 'job_data_invalid';
+        logger.error(errorMessage);
+        // Update job status in finally block
+        return;
+    }
 
-      logger.info(`Starting scrape for campaignId: ${campaignId}, searchUrl: ${searchUrl}, lastPage: ${lastPage}`);
+    logger.info(`Processing scrape job ${currentJobId} for campaign ${campaignId}, requested lastPage: ${lastPage}`);
 
-      // Create a job entry in the database
-      const { data: jobData, error: jobError } = await withTimeout(
-        supabase
-          .from('jobs')
-          .insert({
-            type: 'scrape',
-            status: 'queued', // Changed from 'started' to 'queued'
-            progress: 0,
-            error: null,
-            result: null,
-            campaign_id: campaignId.toString(),
-            created_at: new Date().toISOString(),
-            updated_at: new Date().toISOString(),
-          })
-          .select('job_id')
-          .single(),
-        10000,
-        'Timeout while creating job in database'
-      );
+    // Update job status to processing
+    await withTimeout(
+      supabase.from('jobs').update({ status: 'processing', updated_at: new Date().toISOString() }).eq('job_id', currentJobId),
+      10000, 'Timeout updating job status to processing'
+    );
 
-      if (jobError || !jobData) {
-        logger.error(`Failed to create job: ${jobError?.message}`);
-        return res.status(500).json({ success: false, error: 'Failed to create job' });
-      }
+    // 2. Load Cookies
+    const { cookies, error: cookieError } = await cookieLoader(supabase, { campaignId });
+    if (cookieError || !cookies) {
+      errorMessage = `Failed to load cookies for campaign ${campaignId}: ${cookieError || 'No valid cookies found'}`;
+      errorCategory = 'cookie_load_failed';
+      logger.error(errorMessage);
+      // Update job status in finally block
+      return;
+    }
 
-      jobId = jobData.job_id;
-      logger.info(`Created job with ID: ${jobId} with status: queued`);
+    // 3. Initialize Browser
+    await scraperInstance.initializeBrowser(cookies);
 
-      // Return the job ID immediately to the client
-      res.json({ success: true, jobId });
+    // 4. Perform Scraping
+    const scrapeResult = await scraperInstance.scrapeSearchResults(searchUrl, lastPage);
 
-      // Define the job function
-      const jobFunction = async () => {
-        let browser = null;
-        let page = null;
+    // Check if scraping returned an error object
+    if (scrapeResult && scrapeResult.error) {
+        errorMessage = `Scraping failed: ${scrapeResult.error}`;
+        errorCategory = 'scraping_failed';
+        logger.error(errorMessage);
+        // Use the leads collected so far, if any
+        totalScraped = scrapeResult.leads ? scrapeResult.leads.length : 0;
+        // Don't return yet, proceed to insert what was collected and then fail in finally block
+    } else if (!scrapeResult || !Array.isArray(scrapeResult)) {
+        // Handle cases where scrapeResult is not as expected (e.g., null, undefined, not an array)
+        errorMessage = 'Scraping did not return valid results.';
+        errorCategory = 'scraping_failed';
+        logger.error(errorMessage);
+        totalScraped = 0;
+        // Don't return yet, fail in finally block
+    } else {
+        // Scraping succeeded (or partially succeeded without throwing an error object)
+        totalScraped = scrapeResult.length;
+        logger.info(`Scraped ${totalScraped} raw profiles for job ${currentJobId}.`);
 
-        try {
-          // Update job status to started
-          await withTimeout(
-            supabase
-              .from('jobs')
-              .update({
-                status: 'started',
-                updated_at: new Date().toISOString(),
-              })
-              .eq('job_id', jobId),
-            10000,
-            'Timeout while updating job status to started'
-          );
-
-          // Fetch campaign data
-          const { data: campaignData, error: campaignError } = await withTimeout(
-            supabase
-              .from('campaigns')
-              .select('cookies, client_id')
-              .eq('id', campaignId)
-              .single(),
-            10000,
-            'Timeout while fetching campaign data'
-          );
-
-          if (campaignError || !campaignData?.cookies || !campaignData?.client_id) {
-            const msg = `Could not load campaign cookies and/or client_id for campaign ${campaignId}`;
-            logger.error(msg);
-            await withTimeout(
-              supabase
-                .from('jobs')
-                .update({
-                  status: 'failed',
-                  error: msg,
-                  error_category: 'campaign_load_failed',
-                  updated_at: new Date().toISOString(),
-                })
-                .eq('job_id', jobId),
-              10000,
-              'Timeout while updating job status'
-            );
-            return;
-          }
-
-          const cookies = [
-            { name: 'li_a', value: campaignData.cookies.li_a, domain: '.linkedin.com' },
-            { name: 'li_at', value: campaignData.cookies.li_at, domain: '.linkedin.com' },
-          ];
-
-          // Launch browser and load cookies (no proxyConfig)
-          const { browser: loadedBrowser, page: loadedPage } = await cookieLoader({ cookies, searchUrl });
-          browser = loadedBrowser;
-          page = loadedPage;
-          await zoomHandler(page);
-
-          logger.info(`Scraping pages 1 to ${lastPage}`);
-
-          const scraperInstance = scraper(page, lastPage, searchUrl);
-          let totalInsertedNonPremium = 0;
-          let totalInsertedPremium = 0;
-          const batchSz = Math.min(Number(batchSize) || 10, 25);
-
-          // Scrape and process each page
-          for (let currentPage = 1; currentPage <= lastPage; currentPage++) {
-            let scrapedData = null;
-            for (let attempt = 1; attempt <= 3; attempt++) {
-              try {
-                scrapedData = await scraperInstance.scrapePage(currentPage);
-                break;
-              } catch (error) {
-                logger.warn(`Attempt ${attempt}/3 failed for page ${currentPage}: ${error.message}`);
-                if (attempt === 3) {
-                  logger.error(`Failed to scrape page ${currentPage} after 3 retries: ${error.message}`);
-                  await withTimeout(
-                    supabase
-                      .from('jobs')
-                      .update({
-                        status: 'failed',
-                        error: error.message,
-                        error_category: 'scrape_page_failed',
-                        updated_at: new Date().toISOString(),
-                      })
-                      .eq('job_id', jobId),
-                    10000,
-                    'Timeout while updating job status'
-                  );
-                  return;
-                }
-                const retryDelay = 5000 * attempt;
-                logger.info(`Waiting ${retryDelay}ms before retrying page ${currentPage}`);
-                await new Promise((resolve) => setTimeout(resolve, retryDelay));
-              }
+        // 5. Data Cleaning & Validation
+        const validProfiles = scrapeResult.filter(profile => {
+            // Check for required fields
+            if (!profile || !profile.name || !profile.profileLink) {
+                logger.warn(`Invalid profile found: ${JSON.stringify(profile)}`);
+                return false;
             }
+            return true;
+        });
+        totalValid = validProfiles.length;
+        logger.info(`Validated ${totalValid} profiles.`);
 
-            if (!scrapedData || scrapedData.length === 0) {
-              logger.warn(`No profiles found on page ${currentPage}, continuing to next page`);
-              const progress = currentPage / lastPage;
-              await withTimeout(
-                supabase
-                  .from('jobs')
-                  .update({ status: 'in_progress', progress, updated_at: new Date().toISOString() })
-                  .eq('job_id', jobId),
-                10000,
-                'Timeout while updating job progress'
-              );
-              if (currentPage < lastPage) {
-                const randomDelay = Math.floor(Math.random() * (10000 - 5000 + 1)) + 5000;
-                logger.info(`Waiting ${randomDelay}ms before scraping page ${currentPage + 1}`);
-                await new Promise((resolve) => setTimeout(resolve, randomDelay));
-              }
-              continue;
-            }
+        if (totalValid > 0) {
+            // Add campaign_id before inserting
+            const profilesToInsert = validProfiles.map(p => {
+                // Split full name into first and last name
+                const [firstName = '', ...lastNameParts] = p.name.split(' ');
+                const lastName = lastNameParts.join(' ');
 
-            logger.info(`Processing profiles from page ${currentPage}`);
-
-            const validateProfile = (profile) => {
-              const requiredFields = [
-                'profileLink',
-                'firstName',
-                'lastName',
-                'jobTitle',
-                'companyLink',
-                'connectionLevel',
-              ];
-              return requiredFields.every((field) => profile[field] && typeof profile[field] === 'string' && profile[field].trim() !== '');
-            };
-
-            const completeProfiles = scrapedData.filter((profile) => {
-              const isValid = validateProfile(profile);
-              if (!isValid) {
-                logger.warn(`Skipping incomplete profile: ${JSON.stringify(profile)}`);
-              }
-              return isValid;
+                return {
+                    campaign_id: campaignId,
+                    linkedin: p.profileLink,
+                    first_name: firstName,
+                    last_name: lastName,
+                    job_title: p.jobTitle,
+                    company: p.company,
+                    companylink: p.companyLink,
+                    connection_level: p.connectionLevel,
+                    connection_status: 'not_sent',
+                    scraped_at: new Date().toISOString(),
+                    created_at: new Date().toISOString()
+                };
             });
 
-            logger.info(`Filtered to ${completeProfiles.length} complete profiles from page ${currentPage}`);
-
-            const premiumProfiles = completeProfiles.filter((profile) => profile.isPremium);
-            const nonPremiumProfiles = completeProfiles.filter((profile) => !profile.isPremium);
-
-            for (let i = 0; i < nonPremiumProfiles.length; i += batchSz) {
-              const batch = nonPremiumProfiles.slice(i, i + batchSz);
-              logger.info(`Processing batch ${i / batchSz + 1} (${batch.length} non-premium profiles) from page ${currentPage}`);
-
-              const profilesToInsert = batch.map((profile) => ({
-                campaign_id: campaignId,
-                linkedin: profile.profileLink,
-                first_name: profile.firstName,
-                last_name: profile.lastName,
-                job_title: profile.jobTitle,
-                company: profile.company || null,
-                companylink: profile.companyLink,
-                connection_level: profile.connectionLevel,
-                connection_status: 'not sent',
-                scraped_at: new Date().toISOString(),
-              }));
-
-              const insertedCount = await insertScrapedProfiles(supabase, profilesToInsert);
-              totalInsertedNonPremium += insertedCount;
-
-              if (delayBetweenBatches && i + batchSz < nonPremiumProfiles.length) {
-                logger.info(`Waiting ${delayBetweenBatches}ms before next batch of non-premium profiles on page ${currentPage}`);
-                await new Promise((resolve) => setTimeout(resolve, delayBetweenBatches));
-              }
-            }
-
-            for (let i = 0; i < premiumProfiles.length; i += batchSz) {
-              const batch = premiumProfiles.slice(i, i + batchSz);
-              logger.info(`Processing batch ${i / batchSz + 1} (${batch.length} premium profiles) from page ${currentPage}`);
-
-              const profilesToInsert = batch.map((profile) => ({
-                campaign_id: campaignId.toString(),
-                linkedin: profile.profileLink,
-                full_name: `${profile.firstName} ${profile.lastName}`.trim(),
-                job_title: profile.jobTitle,
-                company: profile.company || null,
-                companyLink: profile.companyLink,
-                connection_level: profile.connectionLevel,
-                scraped_at: new Date().toISOString(),
-                is_open_profile: false,
-                is_checked: false,
-              }));
-
-              const insertedCount = await insertPremiumProfiles(supabase, profilesToInsert);
-              totalInsertedPremium += insertedCount;
-
-              if (delayBetweenBatches && i + batchSz < premiumProfiles.length) {
-                logger.info(`Waiting ${delayBetweenBatches}ms before next batch of premium profiles on page ${currentPage}`);
-                await new Promise((resolve) => setTimeout(resolve, delayBetweenBatches));
-              }
-            }
-
-            const progress = currentPage / lastPage;
-            await withTimeout(
-              supabase
-                .from('jobs')
-                .update({ status: 'in_progress', progress, updated_at: new Date().toISOString() })
-                .eq('job_id', jobId),
-              10000,
-              'Timeout while updating job progress'
-            );
-
-            if (currentPage < lastPage) {
-              const randomDelay = Math.floor(Math.random() * (10000 - 5000 + 1)) + 5000;
-              logger.info(`Waiting ${randomDelay}ms before scraping page ${currentPage + 1}`);
-              await new Promise((resolve) => setTimeout(resolve, randomDelay));
-            }
-          }
-
-          logger.success(`Scraping and storage completed. Total non-premium profiles stored: ${totalInsertedNonPremium}, Total premium profiles stored: ${totalInsertedPremium}`);
-          await withTimeout(
-            supabase
-              .from('jobs')
-              .update({
-                status: 'completed',
-                progress: 1,
-                result: { totalNonPremiumProfilesScraped: totalInsertedNonPremium, totalPremiumProfilesScraped: totalInsertedPremium },
-                updated_at: new Date().toISOString(),
-              })
-              .eq('job_id', jobId),
-            10000,
-            'Timeout while updating job status'
-          );
-        } catch (error) {
-          logger.error(`Error in job ${jobId}: ${error.message}`);
-          let errorCategory = 'unknown';
-          if (error.message.includes('Cookies are invalid')) {
-            errorCategory = 'authentication_failed';
-          } else if (error.message.includes('waitForSelector')) {
-            errorCategory = 'selector_timeout';
-          }
-          await withTimeout(
-            supabase
-              .from('jobs')
-              .update({
-                status: 'failed',
-                error: error.message,
-                error_category: errorCategory,
-                updated_at: new Date().toISOString(),
-              })
-              .eq('job_id', jobId),
-            10000,
-            'Timeout while updating job status'
-          );
-          throw error; // Rethrow for the queue manager
-        } finally {
-          try {
-            if (page) await page.close();
-            if (browser) await browser.close();
-          } catch (err) {
-            logger.error(`Failed to close browser or page for job ${jobId}: ${err.message}`);
-          }
+            // 6. Insert into Database
+            totalInserted = await insertScrapedProfiles(supabase, profilesToInsert, campaignId);
+            logger.info(`Inserted ${totalInserted} new profiles into scraped_profiles for job ${currentJobId}.`);
+        } else {
+            logger.info(`No valid profiles to insert for job ${currentJobId}.`);
         }
-      };
 
-      // Add the job to the queue
-      jobQueueManager.addJob(jobFunction, { 
-        jobId, 
-        type: 'scrape',
-        campaignId: req.body.campaignId
-      }).catch(err => {
-        logger.error(`Queue processing failed for job ${jobId}: ${err.message}`);
-      });
-      
-    } catch (error) {
-      logger.error(`Error in /scrape route: ${error.message}`);
-      if (jobId) {
-        await withTimeout(
-          supabase
-            .from('jobs')
-            .update({
-              status: 'failed',
-              error: error.message,
-              error_category: 'request_validation_failed',
-              updated_at: new Date().toISOString(),
-            })
-            .eq('job_id', jobId),
-          10000,
-          'Timeout while updating job status'
-        );
-      }
-      return res.status(500).json({ success: false, error: error.message });
+        // If scraping didn't explicitly return an error, mark as completed
+        if (!errorMessage) {
+            jobStatus = 'completed';
+            jobResult = {
+                message: `Scraping completed. Scraped: ${totalScraped}, Valid: ${totalValid}, Inserted: ${totalInserted}.`,
+                totalScraped,
+                totalValid,
+                totalInserted
+            };
+            logger.success(`Scrape job ${currentJobId} completed successfully.`);
+        }
     }
-  };
+
+  } catch (error) {
+    // Catch errors from initializeBrowser, insertScrapedProfiles, or other unexpected issues
+    errorMessage = `Unexpected error during scrape job ${currentJobId}: ${error.message}`;
+    errorCategory = 'processing_error';
+    logger.error(errorMessage, error); // Log the full error object
+    jobStatus = 'failed'; // Ensure status is failed
+  } finally {
+    // 7. Close Browser
+    await scraperInstance.closeBrowser();
+
+    // 8. Update Final Job Status
+    logger.info(`Updating job ${currentJobId} with final status: ${jobStatus}`);
+    const finalUpdate = {
+      status: jobStatus,
+      progress: 100, // Mark as 100% done regardless of status
+      error: errorMessage || null, // Store error message if any
+      error_category: jobStatus === 'failed' ? errorCategory : null,
+      result: jobResult, // Store success results if any
+      updated_at: new Date().toISOString(),
+    };
+
+    try {
+      await withTimeout(
+        supabase.from('jobs').update(finalUpdate).eq('job_id', currentJobId),
+        10000, 'Timeout updating final job status'
+      );
+
+      // Send Telegram notification for both success and failure
+      await sendJobStatusReport(
+        currentJobId,
+        'scrape',
+        jobStatus,
+        {
+          campaignId: jobParams?.campaignId,
+          message: errorMessage || (jobResult ? jobResult.message : 'Job finished.'),
+          savedCount: totalInserted,
+          totalScraped,
+          totalValid
+        }
+      );
+    } catch (updateError) {
+      logger.error(`Failed to update final status for job ${currentJobId}: ${updateError.message}`);
+    }
+
+    logger.info(`Finished processing job ${currentJobId}. Status: ${jobStatus}`);
+  }
 };
+
+
+// Function to add a job to the queue
+const addScrapeJob = async (req, res, supabase) => {
+    const logger = createLogger();
+    const { campaignId, searchUrl, lastPage } = req.body;
+
+    if (!campaignId || !searchUrl || !lastPage) {
+        return res.status(400).json({ success: false, error: 'Missing required fields: campaignId, searchUrl, or lastPage' });
+    }
+    if (!Number.isInteger(Number(lastPage)) || Number(lastPage) < 1) {
+        return res.status(400).json({ success: false, error: 'lastPage must be a positive integer' });
+    }
+
+    const jobId = uuidv4();
+
+    try {
+        logger.info(`Received scrape request for campaignId: ${campaignId}, lastPage: ${lastPage}. Assigning Job ID: ${jobId}`);
+
+        // Insert initial job record
+        const { error: insertError } = await withTimeout(
+            supabase.from('jobs').insert({
+                job_id: jobId,
+                type: 'scrape',
+                status: 'queued',
+                progress: 0,
+                error: null,
+                result: null,
+                campaign_id: campaignId.toString(), // Ensure campaign_id is string
+                created_at: new Date().toISOString(),
+                updated_at: new Date().toISOString(),
+            }),
+            10000, 'Timeout creating initial job record'
+        );
+
+        if (insertError) {
+            throw new Error(`Failed to create job record: ${insertError.message}`);
+        }
+
+        // Add job to the queue manager, passing jobParams correctly
+        jobQueueManager.addJob(
+            () => processJob(jobId, supabase, { lastPage, searchUrl, campaignId }), // Add campaignId to jobParams
+            { jobId, type: 'scrape', campaignId }
+        ).catch(err => {
+             logger.error(`Queue processing failed for job ${jobId}: ${err.message}`);
+             // Optionally update job status to failed here if queueing fails
+        });
+
+        logger.info(`Successfully created and queued job ${jobId} for campaign ${campaignId}.`);
+        res.status(202).json({ success: true, message: 'Scrape job accepted and queued.', jobId });
+
+    } catch (error) {
+        logger.error(`Error adding scrape job for campaign ${campaignId}: ${error.message}`);
+        res.status(500).json({ success: false, error: `Failed to queue scrape job: ${error.message}` });
+    }
+};
+
+module.exports = { addScrapeJob }; // Only export addScrapeJob

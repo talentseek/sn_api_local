@@ -1,6 +1,8 @@
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const createLogger = require('./utils/logger');
+const { withTimeout } = require('./utils/databaseUtils');
+const jobQueueManager = require('./utils/jobQueueManager');
 
 const logger = createLogger();
 
@@ -15,14 +17,6 @@ if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID || !TELEGRAM_NOTIFICATION_CHAT_ID) 
 }
 
 const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
-
-// Utility function to add a timeout to Supabase queries
-const withTimeout = async (promise, timeoutMs, errorMessage) => {
-  const timeout = new Promise((_, reject) => {
-    setTimeout(() => reject(new Error(errorMessage)), timeoutMs);
-  });
-  return Promise.race([promise, timeout]);
-};
 
 // Factory function to initialize the bot with Supabase dependency
 const initializeBot = (supabase) => {
@@ -346,8 +340,63 @@ const initializeBot = (supabase) => {
   logger.info('Telegram bot initialized and polling for commands');
 };
 
+// Add or update the job status reporting function
+/**
+ * Send a job status report to the Telegram chat
+ * @param {string} jobId - The job ID
+ * @param {string} jobType - The type of job
+ * @param {string} status - The job status
+ * @param {Object} details - Additional details about the job
+ */
+const sendJobStatusReport = async (jobId, jobType, status, details = {}) => {
+  const logger = createLogger();
+  
+  try {
+    let emoji = '🔄';
+    if (status === 'completed') emoji = '✅';
+    if (status === 'failed') emoji = '❌';
+    if (status === 'started') emoji = '🚀';
+    
+    let message = `${emoji} Job ${jobId} (${jobType}) ${status}\n`;
+    
+    if (details.campaignId) {
+      message += `Campaign: ${details.campaignId}\n`;
+    }
+    
+    if (details.message) {
+      message += `Message: ${details.message}\n`;
+    }
+    
+    if (details.totalLeads !== undefined) {
+      message += `Total leads: ${details.totalLeads}\n`;
+    }
+    
+    if (details.savedCount !== undefined) {
+      message += `Saved: ${details.savedCount}\n`;
+    }
+    
+    if (details.duplicateCount !== undefined) {
+      message += `Duplicates: ${details.duplicateCount}\n`;
+    }
+    
+    if (details.errorCount !== undefined) {
+      message += `Errors: ${details.errorCount}\n`;
+    }
+    
+    if (details.error) {
+      message += `Error: ${details.error}\n`;
+    }
+    
+    await bot.sendMessage(process.env.TELEGRAM_NOTIFICATION_CHAT_ID, message);
+    logger.info(`Sent job status report to Telegram: ${status}`);
+  } catch (error) {
+    logger.error(`Failed to send job status report to Telegram: ${error.message}`);
+  }
+};
+
 // Export the bot instance and initialization function
 module.exports = {
   bot,
   initializeBot,
+  sendJobStatusReport
 };

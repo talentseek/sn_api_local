@@ -114,13 +114,12 @@ const sendConnectionRequest = (page) => {
           }
         }
 
-        // Click the "Connect" button
-        await connectButton.click();
-        logger.info(`Clicked the "Connect" button ${standardProfileUrl ? 'on the standard profile page' : 'in the Sales Navigator menu'}`);
-      } else {
-        // Click the "Connect" button directly on the page
-        await connectButton.click();
-        logger.info('Clicked the "Connect" button directly on the page');
+        // Click the "Connect" button using page.evaluate
+        await page.evaluate((selector) => {
+          const button = document.querySelector(selector);
+          if (button) button.click();
+        }, connectButtonSelector);
+        logger.info('Clicked the "Connect" button using evaluate method');
       }
 
       // Wait for the connection request modal to appear
