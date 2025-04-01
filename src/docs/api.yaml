@@ -10,7 +10,10 @@ paths:
   /api/scrape:
     post:
       summary: Scrape profiles from LinkedIn Sales Navigator search results
-      description: Extracts profile data from LinkedIn Sales Navigator search results and stores them in the database.
+      description: |
+        Extracts profile data from LinkedIn Sales Navigator search results and stores them in the database.
+        Jobs are processed sequentially with a 1-second buffer between jobs to prevent system overload.
+        The scraper uses optimized viewport and zoom settings for reliable data extraction.
       tags:
         - Profile Scraping
       requestBody:
@@ -61,6 +64,30 @@ paths:
                   jobId:
                     type: string
                     example: "12345"
+                  message:
+                    type: string
+                    example: "Job queued successfully. Jobs are processed sequentially with a 1-second buffer between jobs."
+                  queueStatus:
+                    type: object
+                    properties:
+                      queueLength:
+                        type: integer
+                        description: Number of jobs waiting in queue
+                        example: 0
+                      isProcessing:
+                        type: boolean
+                        description: Whether a job is currently being processed
+                        example: false
+                      activeJob:
+                        type: object
+                        description: Details of the currently active job, if any
+                        properties:
+                          jobId:
+                            type: string
+                          type:
+                            type: string
+                          campaignId:
+                            type: integer
         '400':
           description: Bad request - missing or invalid parameters
           content:
