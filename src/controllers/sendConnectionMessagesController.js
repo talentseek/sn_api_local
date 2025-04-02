@@ -3,6 +3,7 @@ const { withTimeout } = require('../utils/databaseUtils');
 const { hasDelayPassed } = require('../utils/dateUtils');
 const messageConnectionModule = require('../modules/messageConnection');
 const { bot } = require('../telegramBot');
+const jobQueueManager = require('../utils/jobQueueManager');
 
 // Function to construct landing page URL in `{firstNameLastInitial}.{companySlug}` format
 const constructLandingPageURL = (lead) => {
@@ -478,10 +479,14 @@ const processJob = async (currentJobId, supabase) => {
 
     // Send notification to Telegram
     try {
+      const failedMessagesText = failedMessages.length > 0 
+        ? failedMessages.map(f => `\n  • ${f.leadId}: ${f.error}`).join('') 
+        : '';
+
       const successMessage = `✅ Connection messages sent for campaign ${campaignId}:\n` +
         `- Leads processed: ${processedLeads}\n` +
         `- Messages sent: ${messagesSent}\n` +
-        `- Failed messages: ${failedMessages}`;
+        `- Failed messages: ${failedMessages.length}${failedMessagesText}`;
       
       await bot.sendMessage(process.env.TELEGRAM_NOTIFICATION_CHAT_ID, successMessage);
       logger.info('Sent completion notification to Telegram');
@@ -556,12 +561,14 @@ module.exports = (supabase) => {
       res.json({ success: true, jobId });
 
       // Process the job asynchronously
-      setImmediate(() => {
-        processJob(jobId, supabase).catch((err) => {
-          const logger = createLogger();
-          logger.error(`Background processing failed for job ${jobId}: ${err.message}`);
-        });
+      // Add job to queue
+      jobQueueManager.addJob(
+        () => processJob(jobId, supabase),
+        { jobId, type: 'send_connection_messages', campaignId }
+      ).catch(err => {
+        logger.error(`Queue processing failed for job ${jobId}: ${err.message}`);
       });
+
     } catch (error) {
       const logger = createLogger();
       logger.error(`Error in /send-connection-messages route: ${error.message}`);

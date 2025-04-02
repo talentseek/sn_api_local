@@ -503,8 +503,25 @@ paths:
   
   /api/send-connection-messages:
     post:
-      summary: Send messages to connections
-      description: Sends messages to accepted connections.
+      summary: Send messages to 1st-degree connections
+      description: |
+        Sends follow-up messages to 1st-degree connections on LinkedIn. Supports multi-stage messaging sequences 
+        with configurable delays between stages. Messages are personalized using profile data and sent in batches 
+        with rate limiting to prevent detection.
+
+        Key features:
+        - Multi-stage message sequences with configurable delays
+        - Personalized messages using profile data
+        - Batch processing with rate limiting
+        - Status tracking and detailed reporting
+        - Telegram notifications for job status
+        - Error handling and recovery
+
+        The system enforces delays between message stages and only processes leads that:
+        - Are 1st-degree connections
+        - Haven't been contacted for the current stage
+        - Haven't replied to previous messages
+        - Have passed the required delay period for their stage
       tags:
         - Messaging
       requestBody:
@@ -521,37 +538,87 @@ paths:
                   description: ID of the campaign
                 messageStage:
                   type: integer
-                  description: Message stage to send
+                  description: Message stage to send (1 for first message, 2+ for follow-ups)
                   default: 1
-                totalMessages:
-                  type: integer
-                  description: Maximum number of messages to send
-                  default: 30
                 batchSize:
                   type: integer
                   description: Number of messages to send in each batch
                   default: 5
-                delayBetweenBatches:
-                  type: integer
-                  description: Delay in milliseconds between batches
-                  default: 5000
             example:
-              campaignId: 123
+              campaignId: 31
               messageStage: 1
-              totalMessages: 30
               batchSize: 5
-              delayBetweenBatches: 5000
       responses:
         '200':
           description: Job started successfully
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/JobResponse'
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+                  jobId:
+                    type: string
+                    example: "msg_1234567890"
+                  message:
+                    type: string
+                    example: "Connection messages job accepted and queued"
         '400':
-          $ref: '#/components/responses/BadRequest'
+          description: Bad request - missing or invalid parameters
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: false
+                  error:
+                    type: string
+                    example: "Missing required field: campaignId"
         '500':
-          $ref: '#/components/responses/ServerError'
+          description: Server error
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: false
+                  error:
+                    type: string
+                    example: "Failed to fetch campaign data"
+      x-codeSamples:
+        - lang: curl
+          source: |
+            curl -X POST http://localhost:8080/api/send-connection-messages \
+            -H "Content-Type: application/json" \
+            -d '{
+              "campaignId": 31,
+              "messageStage": 1,
+              "batchSize": 5
+            }'
+      x-statusCodes:
+        - code: 200
+          description: Job successfully created and queued
+        - code: 400
+          description: Invalid request parameters
+        - code: 500
+          description: Server error occurred
+      x-telegramNotifications:
+        - type: success
+          description: |
+            Job completion notification with statistics:
+            - Total leads processed
+            - Messages sent
+            - Failed messages (with details if any)
+        - type: error
+          description: Job failure notification with error details
+        - type: status
+          description: Status updates during processing
 
 components:
   schemas:
