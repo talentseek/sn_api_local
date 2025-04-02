@@ -50,36 +50,82 @@ class CheckConnectionRequests {
       logger.info(`Navigating to profile: ${profileUrl}`);
       await this.page.goto(profileUrl, { waitUntil: 'networkidle2', timeout: 30000 });
 
-      // Wait for the connection level element to appear
-      const connectionLevelSelector = 'span._name-sublabel--no-pronunciation_sqh8tm span';
-      await this.page.waitForSelector(connectionLevelSelector, { timeout: 10000 });
+      // Try both selectors with fallback logic
+      const connectionLevel = await this.page.evaluate(() => {
+        // Helper function to extract connection level from element
+        const getConnectionLevel = (element) => {
+          if (!element) return null;
+          
+          const spans = element.querySelectorAll('span');
+          const spansArray = Array.from(spans);
+          
+          // Check for separator
+          const hasSeparator = spansArray.some(span => span.classList.contains('separator--middot'));
+          
+          if (hasSeparator) {
+            // Get the last span after separator
+            const lastSpan = spansArray[spansArray.length - 1];
+            return lastSpan ? lastSpan.textContent.trim() : null;
+          } else {
+            // For cases without separator, get the last non-empty span
+            for (let i = spansArray.length - 1; i >= 0; i--) {
+              const text = spansArray[i].textContent.trim();
+              if (text && !text.startsWith('(') && !text.endsWith(')')) {
+                return text;
+              }
+            }
+          }
+          return null;
+        };
 
-      // Extract the connection level (e.g., '1st', '2nd')
-      const connectionLevel = await this.page.evaluate((selector) => {
-        const element = document.querySelector(selector);
-        return element ? element.textContent.trim() : null;
-      }, connectionLevelSelector);
+        // Try primary selector first
+        let element = document.querySelector('span._name-sublabel--no-pronunciation_sqh8tm');
+        if (!element) {
+          // Try fallback selector
+          element = document.querySelector('span._bodyText_1e5nen._default_1i6ulk._sizeSmall_1e5nen._lowEmphasis_1i6ulk');
+        }
+
+        return getConnectionLevel(element);
+      });
 
       if (!connectionLevel) {
+        // Log the actual HTML structure for debugging
+        const htmlStructure = await this.page.evaluate(() => {
+          const element1 = document.querySelector('span._name-sublabel--no-pronunciation_sqh8tm');
+          const element2 = document.querySelector('span._bodyText_1e5nen._default_1i6ulk._sizeSmall_1e5nen._lowEmphasis_1i6ulk');
+          return {
+            primary: element1 ? element1.outerHTML : null,
+            fallback: element2 ? element2.outerHTML : null
+          };
+        });
+        logger.warn(`Connection level not found. HTML structures:\nPrimary: ${htmlStructure.primary}\nFallback: ${htmlStructure.fallback}`);
         throw new Error('Connection level not found on the page');
       }
 
       logger.info(`Connection level for ${profileUrl}: ${connectionLevel}`);
 
-      if (connectionLevel === '1st') {
-        logger.info('Connection request accepted (1st degree connection).');
-        return { status: 'accepted' };
-      } else if (connectionLevel === '2nd') {
-        logger.info('Connection request still pending or not sent (2nd degree connection).');
-        // We can't distinguish between 'pending' and 'not_sent' just from the connection level,
-        // but since this module is called for profiles with status 'pending', we'll assume it's still pending
-        return { status: 'pending' };
-      } else {
-        logger.warn(`Unexpected connection level: ${connectionLevel}`);
-        return { status: 'not_sent' }; // Fallback to allow retrying
+      // Handle all possible connection levels
+      switch (connectionLevel.toLowerCase()) {
+        case '1st':
+          logger.info('Connection request accepted (1st degree connection).');
+          return { status: 'accepted' };
+        case '2nd':
+        case '3rd':
+          // Both 2nd and 3rd degree connections should be treated as pending
+          // since we're checking profiles that had connection requests sent
+          logger.info(`Connection request still pending (${connectionLevel} degree connection).`);
+          return { status: 'pending' };
+        default:
+          logger.warn(`Unexpected connection level: ${connectionLevel}`);
+          return { status: 'not_sent' }; // Fallback to allow retrying
       }
     } catch (error) {
       logger.error(`Error checking connection status for ${profileUrl}: ${error.message}`);
+      // If it's a timeout error, we'll treat it as pending to allow retry
+      if (error.message.includes('timeout')) {
+        logger.warn('Timeout occurred while checking connection status - treating as pending');
+        return { status: 'pending' };
+      }
       throw error;
     }
   }
