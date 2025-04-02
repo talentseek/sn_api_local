@@ -24,6 +24,8 @@ require('./scheduler/checkCookiesScheduler');
 require('./scheduler/sendConnectionsScheduler');
 // Start the check connection requests scheduler
 require('./scheduler/checkConnectionRequestsScheduler');
+// Start the connection messages scheduler
+require('./scheduler/sendConnectionMessagesScheduler');
 const jobQueueManager = require('./utils/jobQueueManager');
 
 const app = express();

@@ -198,7 +198,8 @@ async function checkAndProcessCampaigns() {
       supabase
         .from('campaigns')
         .select('*')
-        .eq('status', 'active'),
+        .eq('status', 'active')
+        .eq('automation_enabled', true),
       10000,
       'Timeout while fetching active campaigns'
     );
