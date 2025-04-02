@@ -20,6 +20,8 @@ const scrapeCompanyDataControllerFactory = require('./controllers/scrapeCompanyD
 const { initializeBot } = require('./telegramBot');
 // Simply require the scheduler file to execute it and start the cron job
 require('./scheduler/checkCookiesScheduler');
+// Start the connection requests scheduler
+require('./scheduler/sendConnectionsScheduler');
 const jobQueueManager = require('./utils/jobQueueManager');
 
 const app = express();
