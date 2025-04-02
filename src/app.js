@@ -22,6 +22,8 @@ const { initializeBot } = require('./telegramBot');
 require('./scheduler/checkCookiesScheduler');
 // Start the connection requests scheduler
 require('./scheduler/sendConnectionsScheduler');
+// Start the check connection requests scheduler
+require('./scheduler/checkConnectionRequestsScheduler');
 const jobQueueManager = require('./utils/jobQueueManager');
 
 const app = express();
