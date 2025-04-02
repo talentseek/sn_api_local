@@ -159,24 +159,26 @@ const processJob = async (currentJobId, supabase) => {
           if (result.status === 'accepted') {
             profilesAccepted++;
 
-            // First check if lead already exists
-            const { data: existingLead, error: checkLeadError } = await withTimeout(
+            // First check if lead already exists - get ALL matching leads
+            const { data: existingLeads, error: checkLeadError } = await withTimeout(
               supabase
                 .from('leads')
-                .select('id')
+                .select('id, linkedin')
                 .eq('client_id', campaignData.client_id)
-                .eq('linkedin', profile.linkedin)
-                .single(),
+                .eq('linkedin', profile.linkedin),
               10000,
-              `Timeout while checking existing lead for profile ${profile.id}`
+              `Timeout while checking existing leads for profile ${profile.id}`
             );
 
-            if (checkLeadError && !checkLeadError.message.includes('No rows found')) {
-              throw new Error(`Failed to check existing lead for profile ${profile.id}: ${checkLeadError.message}`);
+            if (checkLeadError) {
+              throw new Error(`Failed to check existing leads for profile ${profile.id}: ${checkLeadError.message}`);
             }
 
-            if (existingLead) {
-              // Update existing lead
+            // Handle existing leads
+            if (existingLeads && existingLeads.length > 0) {
+              logger.info(`Found ${existingLeads.length} existing lead(s) for profile ${profile.id}`);
+              // Update the first lead we found
+              const leadToUpdate = existingLeads[0];
               const { error: updateLeadError } = await withTimeout(
                 supabase
                   .from('leads')
@@ -190,31 +192,18 @@ const processJob = async (currentJobId, supabase) => {
                     is_open_profile: false,
                     error: null,
                   })
-                  .eq('id', existingLead.id),
+                  .eq('id', leadToUpdate.id),
                 10000,
-                `Timeout while updating lead ${existingLead.id}`
+                `Timeout while updating lead ${leadToUpdate.id}`
               );
 
               if (updateLeadError) {
-                throw new Error(`Failed to update lead ${existingLead.id}: ${updateLeadError.message}`);
+                throw new Error(`Failed to update lead ${leadToUpdate.id}: ${updateLeadError.message}`);
               }
 
-              // Make sure to update the scraped profile status to connected
-              const { error: updateProfileError } = await withTimeout(
-                supabase
-                  .from('scraped_profiles')
-                  .update({
-                    connection_status: 'connected',
-                    error: null,
-                    last_checked: new Date().toISOString(),
-                  })
-                  .eq('id', profile.id),
-                10000,
-                `Timeout while updating scraped profile ${profile.id}`
-              );
-
-              if (updateProfileError) {
-                throw new Error(`Failed to update scraped profile ${profile.id}: ${updateProfileError.message}`);
+              // If we found multiple leads, log it as a warning
+              if (existingLeads.length > 1) {
+                logger.warn(`Multiple leads found for profile ${profile.id} (${profile.linkedin}). Updated lead ${leadToUpdate.id}`);
               }
             } else {
               // Insert new lead
@@ -243,11 +232,12 @@ const processJob = async (currentJobId, supabase) => {
               if (insertLeadError) {
                 throw new Error(`Failed to insert lead for profile ${profile.id}: ${insertLeadError.message}`);
               }
+              logger.info(`Created new lead for profile ${profile.id}`);
             }
 
             profilesMovedToLeads++;
 
-            // Update the scraped_profiles entry
+            // Always update the scraped profile status to connected
             const { error: updateProfileError } = await withTimeout(
               supabase
                 .from('scraped_profiles')
@@ -264,6 +254,7 @@ const processJob = async (currentJobId, supabase) => {
             if (updateProfileError) {
               throw new Error(`Failed to update scraped profile ${profile.id}: ${updateProfileError.message}`);
             }
+            logger.info(`Updated profile ${profile.id} to connected status`);
           } else if (result.status === 'pending') {
             // Update the last_checked timestamp even for pending profiles
             const { error: updateProfileError } = await withTimeout(
