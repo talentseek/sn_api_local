@@ -40,71 +40,48 @@ const initializeBot = (supabase) => {
     const botUsername = botInfo.username;
     logger.info(`Bot username: @${botUsername}`);
 
-    // Define the command regex with the bot's username
-    const commandRegex = new RegExp(`^/campaignstats(?:@${botUsername})?(?:\\s|$)`);
+    // Create regex patterns for each command
+    const campaignStatsOpenRegex = new RegExp(`^/campaignstatsopen(?:@${botUsername})?$`);
+    const campaignStatsConnectionsRegex = new RegExp(`^/campaignstatsconnections(?:@${botUsername})?$`);
 
-    // Handle /campaignstats command (with or without @BotUsername)
-    bot.onText(commandRegex, async (msg) => {
+    // Handler for open profile stats
+    bot.onText(campaignStatsOpenRegex, async (msg) => {
       const chatId = msg.chat.id.toString();
-      logger.info(`Received /campaignstats command from chat ID ${chatId}`);
-
-      // Log the msg.from value for debugging
-      const fromId = msg.from?.id || 'unknown';
-      const fromUsername = msg.from?.username || 'unknown';
-      logger.info(`Command sent by user ID ${fromId} (${fromUsername})`);
-
-      // Log the supabase instance inside the handler
-      logger.info(`Supabase instance inside /campaignstats handler: ${supabase ? 'defined' : 'undefined'}`);
-      if (!supabase || typeof supabase.from !== 'function') {
-        logger.error('Supabase client is not available in /campaignstats handler');
-        await bot.sendMessage(TELEGRAM_NOTIFICATION_CHAT_ID, '❌ Error: Supabase client not initialized. Please contact the administrator.');
-        return;
-      }
-
-      // Only respond to the authorized chat ID
-      if (chatId !== TELEGRAM_CHAT_ID.trim()) {
-        logger.warn(`Unauthorized chat ID ${chatId} attempted to use /campaignstats (expected ${TELEGRAM_CHAT_ID})`);
+      
+      // Check against both chat IDs
+      if (chatId !== process.env.TELEGRAM_NOTIFICATION_CHAT_ID && chatId !== process.env.TELEGRAM_CHAT_ID) {
+        logger.warn(`Unauthorized chat ID ${chatId} attempted to use /campaignstatsopen`);
+        bot.sendMessage(chatId, '⚠️ Unauthorized chat');
         return;
       }
 
       try {
-        // Log before the Supabase query
-        logger.info('Attempting to fetch campaigns from Supabase...');
-        const { data: campaigns, error: campaignError } = await withTimeout(
+        // Fetch active campaigns
+        const { data: campaigns, error } = await withTimeout(
           supabase
             .from('campaigns')
             .select('id, name, client_id')
-            .eq('status', 'active'),
+            .eq('status', 'active')
+            .order('name'),
           10000,
           'Timeout while fetching campaigns'
         );
 
-        // Log the result of the Supabase query
-        logger.info(`Supabase query result: ${campaigns ? `${campaigns.length} campaigns found` : 'No campaigns'}`);
-        if (campaignError) {
-          logger.error(`Failed to fetch campaigns: ${JSON.stringify(campaignError, null, 2)}`);
-          await bot.sendMessage(TELEGRAM_NOTIFICATION_CHAT_ID, '❌ Error fetching campaign statistics. Please try again later.');
-          return;
-        }
-
+        if (error) throw new Error(JSON.stringify(error, null, 2));
         if (!campaigns || campaigns.length === 0) {
-          await bot.sendMessage(TELEGRAM_CHAT_ID, 'ℹ️ No active campaigns found.');
+          bot.sendMessage(chatId, '❌ No active campaigns found');
           return;
         }
 
-        // Build the response message with better formatting and emojis
-        let readyCampaigns = [];
-        let needMoreLeadsCampaigns = [];
+        let activeCampaigns = [];
         let inactiveCampaigns = [];
 
         for (const campaign of campaigns) {
-          // Format the campaign info with emojis and better spacing
           let campaignInfo = `${campaign.name} (ID: ${campaign.id})`;
           
-          // Count leads available to message using client_id
+          // Count leads available to message
           let leadsCount = 0;
           try {
-            logger.info(`Counting leads for campaign ${campaign.id} (client_id: ${campaign.client_id})...`);
             const { count, error: leadsError } = await withTimeout(
               supabase
                 .from('leads')
@@ -116,23 +93,18 @@ const initializeBot = (supabase) => {
               5000,
               `Timeout while counting leads for campaign ${campaign.id}`
             );
-
-            if (leadsError) {
-              throw new Error(JSON.stringify(leadsError, null, 2));
-            }
+            if (leadsError) throw new Error(JSON.stringify(leadsError, null, 2));
             leadsCount = count || 0;
-            logger.info(`Found ${leadsCount} leads for campaign ${campaign.id}`);
           } catch (error) {
-            logger.error(`Failed to count leads for campaign ${campaign.id} (client_id: ${campaign.client_id}): ${error.message}`);
+            logger.error(`Failed to count leads for campaign ${campaign.id}: ${error.message}`);
             campaignInfo += ' ❌ Error fetching leads';
             inactiveCampaigns.push(campaignInfo);
             continue;
           }
 
-          // Count premium profiles to check
+          // Count premium profiles
           let premiumCount = 0;
           try {
-            logger.info(`Counting premium profiles for campaign ${campaign.id}...`);
             const { count, error: premiumError } = await withTimeout(
               supabase
                 .from('premium_profiles')
@@ -141,25 +113,133 @@ const initializeBot = (supabase) => {
                 .eq('is_checked', false)
                 .eq('moved_to_leads', false),
               5000,
-              `Timeout while counting premium profiles for campaign ${campaign.id}`
+              `Timeout while counting premium profiles`
             );
-
-            if (premiumError) {
-              throw new Error(JSON.stringify(premiumError, null, 2));
-            }
+            if (premiumError) throw new Error(JSON.stringify(premiumError, null, 2));
             premiumCount = count || 0;
-            logger.info(`Found ${premiumCount} premium profiles for campaign ${campaign.id}`);
           } catch (error) {
-            logger.error(`Failed to count premium profiles for campaign ${campaign.id}: ${error.message}`);
+            logger.error(`Failed to count premium profiles: ${error.message}`);
             campaignInfo += ' ❌ Error fetching premium profiles';
             inactiveCampaigns.push(campaignInfo);
             continue;
           }
 
-          // Count scraped profiles awaiting connection requests
+          // Count leads awaiting 2nd follow-up
+          let awaitingSecondFollowupCount = 0;
+          try {
+            const { count, error: secondFollowupError } = await withTimeout(
+              supabase
+                .from('leads')
+                .select('id', { count: 'exact', head: true })
+                .eq('client_id', campaign.client_id)
+                .eq('message_sent', true)
+                .eq('is_open_profile', true)
+                .eq('message_stage', 2),
+              5000,
+              `Timeout while counting leads awaiting 2nd follow-up`
+            );
+            if (secondFollowupError) throw new Error(JSON.stringify(secondFollowupError, null, 2));
+            awaitingSecondFollowupCount = count || 0;
+          } catch (error) {
+            logger.error(`Failed to count leads awaiting 2nd follow-up: ${error.message}`);
+          }
+
+          // Count leads awaiting 3rd follow-up
+          let awaitingThirdFollowupCount = 0;
+          try {
+            const { count, error: thirdFollowupError } = await withTimeout(
+              supabase
+                .from('leads')
+                .select('id', { count: 'exact', head: true })
+                .eq('client_id', campaign.client_id)
+                .eq('message_sent', true)
+                .eq('is_open_profile', true)
+                .eq('message_stage', 3),
+              5000,
+              `Timeout while counting leads awaiting 3rd follow-up`
+            );
+            if (thirdFollowupError) throw new Error(JSON.stringify(thirdFollowupError, null, 2));
+            awaitingThirdFollowupCount = count || 0;
+          } catch (error) {
+            logger.error(`Failed to count leads awaiting 3rd follow-up: ${error.message}`);
+          }
+
+          // Add stats to campaign info
+          campaignInfo += `\n   📨 ${leadsCount} leads available to message`;
+          if (premiumCount > 0) {
+            campaignInfo += `\n   🔍 ${premiumCount} premium profiles to check`;
+          }
+          if (awaitingSecondFollowupCount > 0) {
+            campaignInfo += `\n   📬 ${awaitingSecondFollowupCount} leads awaiting 2nd follow-up`;
+          }
+          if (awaitingThirdFollowupCount > 0) {
+            campaignInfo += `\n   📭 ${awaitingThirdFollowupCount} leads awaiting 3rd follow-up`;
+          }
+
+          if (leadsCount > 0 || premiumCount > 0 || awaitingSecondFollowupCount > 0 || awaitingThirdFollowupCount > 0) {
+            activeCampaigns.push(campaignInfo);
+          } else {
+            inactiveCampaigns.push(campaignInfo);
+          }
+        }
+
+        // Send the report
+        let message = '📊 *Open Profile Campaign Stats*\n\n';
+        
+        if (activeCampaigns.length > 0) {
+          message += '*Active Campaigns:*\n' + activeCampaigns.join('\n\n');
+        }
+        
+        if (inactiveCampaigns.length > 0) {
+          if (activeCampaigns.length > 0) message += '\n\n';
+          message += '*Inactive Campaigns:*\n' + inactiveCampaigns.join('\n\n');
+        }
+
+        bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+      } catch (error) {
+        logger.error('Error in campaignstatsopen command:', error);
+        bot.sendMessage(chatId, `❌ Error fetching campaign stats: ${error.message}`);
+      }
+    });
+
+    // Handler for connection stats
+    bot.onText(campaignStatsConnectionsRegex, async (msg) => {
+      const chatId = msg.chat.id.toString();
+      
+      // Check against both chat IDs
+      if (chatId !== process.env.TELEGRAM_NOTIFICATION_CHAT_ID && chatId !== process.env.TELEGRAM_CHAT_ID) {
+        logger.warn(`Unauthorized chat ID ${chatId} attempted to use /campaignstatsconnections`);
+        bot.sendMessage(chatId, '⚠️ Unauthorized chat');
+        return;
+      }
+
+      try {
+        // Fetch active campaigns
+        const { data: campaigns, error } = await withTimeout(
+          supabase
+            .from('campaigns')
+            .select('id, name, client_id')
+            .eq('status', 'active')
+            .order('name'),
+          10000,
+          'Timeout while fetching campaigns'
+        );
+
+        if (error) throw new Error(JSON.stringify(error, null, 2));
+        if (!campaigns || campaigns.length === 0) {
+          bot.sendMessage(chatId, '❌ No active campaigns found');
+          return;
+        }
+
+        let activeCampaigns = [];
+        let inactiveCampaigns = [];
+
+        for (const campaign of campaigns) {
+          let campaignInfo = `${campaign.name} (ID: ${campaign.id})`;
+          
+          // Count leads awaiting connection
           let awaitingConnectionCount = 0;
           try {
-            logger.info(`Checking scraped profiles for campaign ${campaign.id} with connection_status null or 'not sent'`);
             const { count: nullCount, error: nullError } = await withTimeout(
               supabase
                 .from('scraped_profiles')
@@ -167,7 +247,7 @@ const initializeBot = (supabase) => {
                 .eq('campaign_id', campaign.id.toString())
                 .is('connection_status', null),
               5000,
-              `Timeout while counting scraped profiles with null status for campaign ${campaign.id}`
+              `Timeout while counting profiles with null status`
             );
 
             const { count: notSentCount, error: notSentError } = await withTimeout(
@@ -177,167 +257,153 @@ const initializeBot = (supabase) => {
                 .eq('campaign_id', campaign.id.toString())
                 .eq('connection_status', 'not sent'),
               5000,
-              `Timeout while counting scraped profiles with 'not sent' status for campaign ${campaign.id}`
+              `Timeout while counting profiles with 'not sent' status`
             );
 
-            if (nullError) {
-              throw new Error(JSON.stringify(nullError, null, 2));
-            }
-            if (notSentError) {
-              throw new Error(JSON.stringify(notSentError, null, 2));
-            }
+            if (nullError) throw new Error(JSON.stringify(nullError, null, 2));
+            if (notSentError) throw new Error(JSON.stringify(notSentError, null, 2));
 
             awaitingConnectionCount = (nullCount || 0) + (notSentCount || 0);
-            logger.info(`Found ${nullCount || 0} profiles with null status and ${notSentCount || 0} with 'not sent' status for campaign ${campaign.id}`);
-
-            // If count is still 0, let's do a sample query to see what values exist
-            if (awaitingConnectionCount === 0) {
-              try {
-                const { data: sampleData } = await withTimeout(
-                  supabase
-                    .from('scraped_profiles')
-                    .select('id, connection_status')
-                    .eq('campaign_id', campaign.id.toString())
-                    .limit(5),
-                  5000,
-                  `Timeout while sampling scraped profiles for campaign ${campaign.id}`
-                );
-                
-                if (sampleData && sampleData.length > 0) {
-                  logger.info(`Sample scraped profiles for campaign ${campaign.id}: ${JSON.stringify(sampleData)}`);
-                } else {
-                  logger.info(`No scraped profiles found for campaign ${campaign.id}`);
-                }
-              } catch (error) {
-                logger.error(`Error sampling scraped profiles: ${error.message}`);
-              }
-            }
           } catch (error) {
-            logger.error(`Failed to count scraped profiles for campaign ${campaign.id}: ${error.message}`);
-            campaignInfo += ' ❌ Error fetching scraped profiles';
-            // Don't continue here, we still want to show the campaign with the data we have
+            logger.error(`Failed to count awaiting connections: ${error.message}`);
+            campaignInfo += ' ❌ Error fetching connection requests';
+            inactiveCampaigns.push(campaignInfo);
+            continue;
           }
 
-          // Count leads awaiting 2nd follow-up (message_sent true, message_stage 2)
-          let awaitingSecondFollowupCount = 0;
+          // Count pending connection requests
+          let pendingConnectionCount = 0;
           try {
-            logger.info(`Counting leads awaiting 2nd follow-up for campaign ${campaign.id} (client_id: ${campaign.client_id})...`);
+            const { count, error: pendingError } = await withTimeout(
+              supabase
+                .from('scraped_profiles')
+                .select('id', { count: 'exact', head: true })
+                .eq('campaign_id', campaign.id.toString())
+                .eq('connection_status', 'pending'),
+              5000,
+              `Timeout while counting pending connections`
+            );
+            if (pendingError) throw new Error(JSON.stringify(pendingError, null, 2));
+            pendingConnectionCount = count || 0;
+          } catch (error) {
+            logger.error(`Failed to count pending connections: ${error.message}`);
+          }
+
+          // Count connections available to message
+          let connectionsToMessageCount = 0;
+          try {
+            const { count, error: connectionsError } = await withTimeout(
+              supabase
+                .from('leads')
+                .select('id', { count: 'exact', head: true })
+                .eq('client_id', campaign.client_id)
+                .eq('message_sent', false)
+                .eq('is_open_profile', false)
+                .eq('connection_level', '1st')
+                .eq('status', 'not_replied'),
+              5000,
+              `Timeout while counting connections to message`
+            );
+            if (connectionsError) throw new Error(JSON.stringify(connectionsError, null, 2));
+            connectionsToMessageCount = count || 0;
+          } catch (error) {
+            logger.error(`Failed to count connections to message: ${error.message}`);
+          }
+
+          // Count connections awaiting 2nd follow-up
+          let connectionsSecondFollowupCount = 0;
+          try {
             const { count, error: secondFollowupError } = await withTimeout(
               supabase
                 .from('leads')
                 .select('id', { count: 'exact', head: true })
                 .eq('client_id', campaign.client_id)
                 .eq('message_sent', true)
+                .eq('is_open_profile', false)
+                .eq('connection_level', '1st')
                 .eq('message_stage', 2),
               5000,
-              `Timeout while counting leads awaiting 2nd follow-up for campaign ${campaign.id}`
+              `Timeout while counting connections awaiting 2nd follow-up`
             );
-
-            if (secondFollowupError) {
-              throw new Error(JSON.stringify(secondFollowupError, null, 2));
-            }
-            awaitingSecondFollowupCount = count || 0;
-            logger.info(`Found ${awaitingSecondFollowupCount} leads awaiting 2nd follow-up for campaign ${campaign.id}`);
+            if (secondFollowupError) throw new Error(JSON.stringify(secondFollowupError, null, 2));
+            connectionsSecondFollowupCount = count || 0;
           } catch (error) {
-            logger.error(`Failed to count leads awaiting 2nd follow-up for campaign ${campaign.id}: ${error.message}`);
-            // Don't continue here, we still want to show the campaign with the data we have
+            logger.error(`Failed to count connections awaiting 2nd follow-up: ${error.message}`);
           }
 
-          // Count leads awaiting 3rd follow-up (message_sent true, message_stage 3)
-          let awaitingThirdFollowupCount = 0;
+          // Count connections awaiting 3rd follow-up
+          let connectionsThirdFollowupCount = 0;
           try {
-            logger.info(`Counting leads awaiting 3rd follow-up for campaign ${campaign.id} (client_id: ${campaign.client_id})...`);
             const { count, error: thirdFollowupError } = await withTimeout(
               supabase
                 .from('leads')
                 .select('id', { count: 'exact', head: true })
                 .eq('client_id', campaign.client_id)
                 .eq('message_sent', true)
+                .eq('is_open_profile', false)
+                .eq('connection_level', '1st')
                 .eq('message_stage', 3),
               5000,
-              `Timeout while counting leads awaiting 3rd follow-up for campaign ${campaign.id}`
+              `Timeout while counting connections awaiting 3rd follow-up`
             );
-
-            if (thirdFollowupError) {
-              throw new Error(JSON.stringify(thirdFollowupError, null, 2));
-            }
-            awaitingThirdFollowupCount = count || 0;
-            logger.info(`Found ${awaitingThirdFollowupCount} leads awaiting 3rd follow-up for campaign ${campaign.id}`);
+            if (thirdFollowupError) throw new Error(JSON.stringify(thirdFollowupError, null, 2));
+            connectionsThirdFollowupCount = count || 0;
           } catch (error) {
-            logger.error(`Failed to count leads awaiting 3rd follow-up for campaign ${campaign.id}: ${error.message}`);
-            // Don't continue here, we still want to show the campaign with the data we have
+            logger.error(`Failed to count connections awaiting 3rd follow-up: ${error.message}`);
           }
 
-          // Add the counts to the campaign info
-          campaignInfo += `\n   📨 ${leadsCount} leads available to message`;
-          if (premiumCount > 0) {
-            campaignInfo += `\n   🔍 ${premiumCount} premium profiles to check`;
+          // Add stats to campaign info
+          campaignInfo += `\n   🔗 ${awaitingConnectionCount} leads awaiting connection`;
+          if (pendingConnectionCount > 0) {
+            campaignInfo += `\n   ⏳ ${pendingConnectionCount} pending connection requests`;
           }
-          if (awaitingConnectionCount > 0) {
-            campaignInfo += `\n   🔗 ${awaitingConnectionCount} leads awaiting connection`;
+          if (connectionsToMessageCount > 0) {
+            campaignInfo += `\n   📨 ${connectionsToMessageCount} connections available to message`;
           }
-          if (awaitingSecondFollowupCount > 0) {
-            campaignInfo += `\n   📬 ${awaitingSecondFollowupCount} leads awaiting 2nd follow-up`;
+          if (connectionsSecondFollowupCount > 0) {
+            campaignInfo += `\n   📬 ${connectionsSecondFollowupCount} connections awaiting 2nd follow-up`;
           }
-          if (awaitingThirdFollowupCount > 0) {
-            campaignInfo += `\n   📭 ${awaitingThirdFollowupCount} leads awaiting 3rd follow-up`;
+          if (connectionsThirdFollowupCount > 0) {
+            campaignInfo += `\n   📭 ${connectionsThirdFollowupCount} connections awaiting 3rd follow-up`;
           }
 
-          // Update the categorization logic to include campaigns with follow-ups
-          if (leadsCount >= 40) {
-            readyCampaigns.push(campaignInfo);
-          } else if (leadsCount > 0 || premiumCount > 0 || awaitingConnectionCount > 0 || 
-                     awaitingSecondFollowupCount > 0 || awaitingThirdFollowupCount > 0) {
-            needMoreLeadsCampaigns.push(campaignInfo);
+          if (awaitingConnectionCount > 0 || pendingConnectionCount > 0 || 
+              connectionsToMessageCount > 0 || connectionsSecondFollowupCount > 0 || 
+              connectionsThirdFollowupCount > 0) {
+            activeCampaigns.push(campaignInfo);
           } else {
             inactiveCampaigns.push(campaignInfo);
           }
         }
 
-        // Build the final response with sections
-        let response = '📊 *Campaign Statistics*\n\n';
-
-        if (readyCampaigns.length > 0) {
-          response += '✅ *Ready Campaigns* (40+ leads available):\n';
-          readyCampaigns.forEach((campaign, index) => {
-            response += `${index + 1}. ${campaign}\n\n`;
-          });
+        // Send the report
+        let message = '📊 *Connection Campaign Stats*\n\n';
+        
+        if (activeCampaigns.length > 0) {
+          message += '*Active Campaigns:*\n' + activeCampaigns.join('\n\n');
         }
-
-        if (needMoreLeadsCampaigns.length > 0) {
-          if (readyCampaigns.length > 0) response += '\n';
-          response += '⏳ *Campaigns Needing More Leads*:\n';
-          needMoreLeadsCampaigns.forEach((campaign, index) => {
-            response += `${index + 1}. ${campaign}\n\n`;
-          });
-        }
-
+        
         if (inactiveCampaigns.length > 0) {
-          if (readyCampaigns.length > 0 || needMoreLeadsCampaigns.length > 0) response += '\n';
-          response += '💤 *Inactive Campaigns* (no leads or profiles):\n';
-          inactiveCampaigns.forEach((campaign, index) => {
-            response += `${index + 1}. ${campaign}\n\n`;
-          });
+          if (activeCampaigns.length > 0) message += '\n\n';
+          message += '*Inactive Campaigns:*\n' + inactiveCampaigns.join('\n\n');
         }
 
-        // Send the formatted message with Markdown parsing
-        await bot.sendMessage(TELEGRAM_CHAT_ID, response, { parse_mode: 'Markdown' });
-        logger.info('Sent campaign statistics to Telegram');
+        bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
       } catch (error) {
-        logger.error(`Error handling /campaignstats command: ${error.message}`);
-        await bot.sendMessage(TELEGRAM_NOTIFICATION_CHAT_ID, '❌ Error fetching campaign statistics. Please try again later.');
+        logger.error('Error in campaignstatsconnections command:', error);
+        bot.sendMessage(chatId, `❌ Error fetching campaign stats: ${error.message}`);
       }
     });
+
+    // Log polling errors
+    bot.on('polling_error', (error) => {
+      logger.error(`Telegram bot polling error: ${error.message}`);
+    });
+
+    logger.info('Telegram bot initialized and polling for commands');
   }).catch((error) => {
     logger.error(`Failed to fetch bot info: ${error.message}`);
   });
-
-  // Log polling errors
-  bot.on('polling_error', (error) => {
-    logger.error(`Telegram bot polling error: ${error.message}`);
-  });
-
-  logger.info('Telegram bot initialized and polling for commands');
 };
 
 // Add or update the job status reporting function
