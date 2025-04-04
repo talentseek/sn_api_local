@@ -192,10 +192,51 @@ async function logActivity(campaignId, stage, status, counts = {}, error = null,
   }
 }
 
+// Function to validate message templates
+async function validateMessageTemplates(campaign) {
+  const { data: campaignData } = await supabase
+    .from('campaigns')
+    .select('connection_messages')
+    .eq('id', campaign.id)
+    .single();
+
+  if (!campaignData?.connection_messages?.messages) {
+    logger.warn(`Campaign ${campaign.id} has no message templates configured`);
+    return false;
+  }
+
+  const messages = campaignData.connection_messages.messages;
+  const requiredStages = [1, 2, 3];
+  const configuredStages = messages.map(m => m.stage);
+
+  // Check if all required stages are configured
+  const missingStages = requiredStages.filter(stage => !configuredStages.includes(stage));
+  if (missingStages.length > 0) {
+    logger.warn(`Campaign ${campaign.id} is missing message templates for stages: ${missingStages.join(', ')}`);
+    return false;
+  }
+
+  // Validate each message template
+  for (const message of messages) {
+    if (!message.content || typeof message.content !== 'string' || message.content.trim().length === 0) {
+      logger.warn(`Campaign ${campaign.id} has invalid message template for stage ${message.stage}`);
+      return false;
+    }
+  }
+
+  return true;
+}
+
 // Function to process messages for a specific stage
 async function processMessageStage(campaign, messageStage) {
   if (await isInCooldown(campaign.id)) {
     logger.info(`Campaign ${campaign.id} is in cooldown period, skipping...`);
+    return;
+  }
+
+  // Validate message templates first
+  if (!await validateMessageTemplates(campaign)) {
+    logger.warn(`Skipping campaign ${campaign.id} due to invalid message templates`);
     return;
   }
 
@@ -212,6 +253,37 @@ async function processMessageStage(campaign, messageStage) {
   const activityLogId = await logActivity(campaign.id, messageStage.stage, 'running');
   
   try {
+    // Get leads with their last_contacted dates, ordered by connection date
+    const { data: leads, error: leadsError } = await supabase
+      .from('leads')
+      .select('id, message_stage, last_contacted, connected_at')
+      .eq('campaign_id', campaign.id)
+      .eq('connection_level', '1st')
+      .eq('status', 'not_replied')
+      .order('connected_at', { ascending: true })
+      .limit(100);
+
+    if (leadsError) {
+      throw new Error(`Failed to fetch leads: ${leadsError.message}`);
+    }
+
+    // Filter eligible leads based on stage and delay
+    const eligibleLeads = leads.filter(lead => {
+      if (messageStage.stage === 1) {
+        return lead.message_stage === null;
+      } else {
+        return (
+          lead.message_stage === messageStage.stage - 1 &&
+          hasDelayPassed(lead.last_contacted, messageStage.delay_days)
+        );
+      }
+    });
+
+    if (eligibleLeads.length === 0) {
+      logger.info(`No eligible leads found for campaign ${campaign.id} stage ${messageStage.stage}`);
+      return;
+    }
+
     // Send message request
     const response = await fetch('http://localhost:8080/api/send-connection-messages', {
       method: 'POST',
@@ -220,14 +292,14 @@ async function processMessageStage(campaign, messageStage) {
         campaignId: campaign.id,
         messageStage: messageStage.stage,
         batchSize: batchSize,
-        delayDays: messageStage.delay_days // Pass the delay_days to the controller
+        delayDays: messageStage.delay_days,
+        leadIds: eligibleLeads.slice(0, batchSize).map(l => l.id)
       })
     });
 
     const result = await response.json();
 
     if (!result.success) {
-      // Use resistance handler to detect and handle LinkedIn resistance
       if (result.error) {
         const resistanceResult = await resistanceHandler.handleResistance(campaign.id, result.error);
         if (resistanceResult) {
@@ -256,6 +328,13 @@ async function processMessageStage(campaign, messageStage) {
       { total: 0, successful: 0, failed: 0 }, 
       error.message
     );
+
+    // Implement retry mechanism for non-resistance errors
+    if (!error.message.toLowerCase().includes('resistance') && 
+        !error.message.toLowerCase().includes('captcha')) {
+      logger.info(`Scheduling retry for campaign ${campaign.id} in 5 minutes`);
+      setTimeout(() => processMessageStage(campaign, messageStage), 5 * 60 * 1000);
+    }
 
     return 0;
   }
