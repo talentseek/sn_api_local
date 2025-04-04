@@ -29,6 +29,16 @@ const TIME_WINDOWS = {
   'Asia': { start: 0, end: 6 }
 };
 
+// Connection request configuration
+const CONNECTION_CONFIG = {
+  requestsPerDay: 20,
+  batchSize: 5,
+  minBatchesPerWindow: 4, // Spread 20 requests across at least 4 batches
+  delayBetweenBatches: 5000,
+  delayBetweenProfiles: 5000,
+  maxRetriesPerProfile: 3
+};
+
 // Utility function to add a delay
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -52,6 +62,11 @@ const isWithinTimeWindow = (timezone) => {
 
 // Function to update daily connection count
 async function updateDailyConnectionCount(campaignId, connectionsToAdd) {
+  if (!connectionsToAdd || typeof connectionsToAdd !== 'number') {
+    logger.warn(`Invalid connectionsToAdd value for campaign ${campaignId}: ${connectionsToAdd}`);
+    connectionsToAdd = 0;
+  }
+
   const today = new Date().toISOString().split('T')[0];
   
   try {
@@ -68,26 +83,52 @@ async function updateDailyConnectionCount(campaignId, connectionsToAdd) {
     }
 
     if (existing) {
-      // Update existing record
+      // Update existing record, ensure we're not adding to null
+      const currentCount = existing.connections_sent || 0;
       const { error: updateError } = await supabase
         .from('daily_connection_tracking')
-        .update({ connections_sent: existing.connections_sent + connectionsToAdd })
+        .update({ connections_sent: currentCount + connectionsToAdd })
         .eq('campaign_id', campaignId)
         .eq('date', today);
 
       if (updateError) throw updateError;
     } else {
-      // Insert new record
+      // Insert new record, initialize with connectionsToAdd
       const { error: insertError } = await supabase
         .from('daily_connection_tracking')
         .insert({
           campaign_id: campaignId,
           date: today,
-          connections_sent: connectionsToAdd
+          connections_sent: connectionsToAdd,
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString()
         });
 
       if (insertError) throw insertError;
     }
+
+    // Verify the update/insert was successful
+    const { data: verification, error: verifyError } = await supabase
+      .from('daily_connection_tracking')
+      .select('connections_sent')
+      .eq('campaign_id', campaignId)
+      .eq('date', today)
+      .single();
+
+    if (verifyError) {
+      throw verifyError;
+    }
+
+    if (verification.connections_sent === null) {
+      logger.error(`Connections sent is still null for campaign ${campaignId} after update`);
+      // Fix the null value
+      await supabase
+        .from('daily_connection_tracking')
+        .update({ connections_sent: connectionsToAdd })
+        .eq('campaign_id', campaignId)
+        .eq('date', today);
+    }
+
   } catch (error) {
     logger.error(`Failed to update daily connection count for campaign ${campaignId}: ${error.message}`);
     throw error;
@@ -118,36 +159,77 @@ async function getRemainingDailyLimit(campaignId, dailyLimit) {
   }
 }
 
-// Main function to process connection requests for a campaign
+// Function to calculate optimal batch size
+function calculateOptimalBatchSize(remainingLimit, timeWindow, currentHour) {
+  // Calculate time position in window
+  let hoursRemaining;
+  if (currentHour >= timeWindow.start && currentHour < timeWindow.end) {
+    hoursRemaining = timeWindow.end - currentHour;
+  } else if (currentHour < timeWindow.start) {
+    hoursRemaining = timeWindow.end - timeWindow.start;
+  } else {
+    return 0; // Outside window
+  }
+
+  // Calculate runs remaining in the window (2 runs per hour)
+  const runsRemaining = Math.max(1, hoursRemaining * 2);
+  
+  // Calculate ideal batch size
+  const idealBatchSize = Math.ceil(remainingLimit / runsRemaining);
+  
+  // Return the smaller of ideal batch size, configured batch size, and remaining limit
+  return Math.min(
+    idealBatchSize,
+    CONNECTION_CONFIG.batchSize,
+    remainingLimit
+  );
+}
+
+// Function to process connection requests for a campaign
 async function processConnectionRequests(campaign) {
   const startTime = new Date().toISOString();
-  
-  // Log start of activity
-  await logActivity(supabase, campaign.id, 'connection_request', 'running', 
-    { total: 0, successful: 0, failed: 0 }, 
-    null,
-    { startTime }
-  );
+  const logger = createLogger();
   
   try {
-    // Check remaining daily limit
-    const remainingLimit = await getRemainingDailyLimit(campaign.id, campaign.daily_connection_limit);
-    if (remainingLimit <= 0) {
-      logger.info(`Daily limit reached for campaign ${campaign.id}`);
-      await logActivity(supabase, campaign.id, 'connection_request', 'success', 
-        { total: 0, successful: 0, failed: 0 }, 
-        null, 
-        { 
-          message: 'Daily limit reached',
-          startTime
-        }
-      );
+    // Check if campaign is in cooldown
+    const { data: cooldown } = await supabase
+      .from('campaign_cooldowns')
+      .select('cooldown_until')
+      .eq('campaign_id', campaign.id)
+      .single();
+
+    if (cooldown && new Date(cooldown.cooldown_until) > new Date()) {
+      logger.info(`Campaign ${campaign.id} is in cooldown until ${cooldown.cooldown_until}`);
       return;
     }
 
-    // Adjust maxProfiles based on remaining limit
-    const config = campaign.connection_request_config;
-    const maxProfiles = Math.min(remainingLimit, 20); // Never send more than 20 at once
+    // Get daily tracking record
+    const { data: tracking } = await supabase
+      .from('daily_connection_tracking')
+      .select('connections_sent')
+      .eq('campaign_id', campaign.id)
+      .eq('date', new Date().toISOString().split('T')[0])
+      .single();
+
+    const sentToday = tracking?.connections_sent || 0;
+    const remainingLimit = Math.max(0, CONNECTION_CONFIG.requestsPerDay - sentToday);
+
+    if (remainingLimit <= 0) {
+      logger.info(`Daily limit reached for campaign ${campaign.id} (sent: ${sentToday})`);
+      return;
+    }
+
+    // Calculate optimal batch size
+    const timeWindow = TIME_WINDOWS[campaign.timezone];
+    const currentHour = new Date().getHours();
+    const optimalBatchSize = calculateOptimalBatchSize(remainingLimit, timeWindow, currentHour);
+
+    if (optimalBatchSize === 0) {
+      logger.info(`No connections to send for campaign ${campaign.id} at this time`);
+      return;
+    }
+
+    logger.info(`Processing campaign ${campaign.id} with batch size ${optimalBatchSize} (${remainingLimit} remaining)`);
 
     // Send connection requests
     const response = await fetch('http://localhost:8080/api/send-connection-requests', {
@@ -155,11 +237,11 @@ async function processConnectionRequests(campaign) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         campaignId: campaign.id,
-        maxProfiles,
-        batchSize: config.batchSize,
-        delayBetweenBatches: config.delayBetweenBatches,
-        delayBetweenProfiles: config.delayBetweenProfiles,
-        sendMessage: config.sendMessage
+        maxProfiles: optimalBatchSize,
+        batchSize: CONNECTION_CONFIG.batchSize,
+        delayBetweenBatches: CONNECTION_CONFIG.delayBetweenBatches,
+        delayBetweenProfiles: CONNECTION_CONFIG.delayBetweenProfiles,
+        maxRetries: CONNECTION_CONFIG.maxRetriesPerProfile
       })
     });
 
@@ -169,32 +251,57 @@ async function processConnectionRequests(campaign) {
       throw new Error(result.error || 'Failed to send connection requests');
     }
 
-    // Update daily count and last request time
-    await updateDailyConnectionCount(campaign.id, result.sentCount);
-    await supabase
-      .from('campaigns')
-      .update({ last_connection_request_at: new Date().toISOString() })
-      .eq('id', campaign.id);
+    // Update tracking and campaign status
+    await Promise.all([
+      // Update daily tracking
+      updateDailyConnectionCount(campaign.id, result.sentCount),
+      
+      // Update campaign status - First get current total
+      (async () => {
+        const { data: currentCampaign } = await supabase
+          .from('campaigns')
+          .select('total_connections_sent')
+          .eq('id', campaign.id)
+          .single();
+        
+        const newTotal = (currentCampaign?.total_connections_sent || 0) + result.sentCount;
+        
+        await supabase
+          .from('campaigns')
+          .update({
+            last_connection_request_at: new Date().toISOString(),
+            total_connections_sent: newTotal
+          })
+          .eq('id', campaign.id);
+      })(),
+      
+      // Log activity
+      logActivity(campaign.id, 'connection_request', 'success', {
+        total: result.totalProcessed,
+        successful: result.sentCount,
+        failed: result.failedCount
+      }, null, {
+        batchMetrics: {
+          optimalBatchSize,
+          remainingLimit,
+          sentToday
+        }
+      })
+    ]);
 
-    // Log success
-    await logActivity(supabase, campaign.id, 'connection_request', 'success', {
-      total: result.totalProcessed,
-      successful: result.sentCount,
-      failed: result.failedRequests
-    }, null, {
-      startTime,
-      remainingLimit: remainingLimit - result.sentCount,
-      config: campaign.connection_request_config
-    });
+    logger.success(`Successfully processed ${result.sentCount} connection requests for campaign ${campaign.id}`);
 
   } catch (error) {
-    logger.error(`Error processing connection requests for campaign ${campaign.id}: ${error.message}`);
+    logger.error(`Error processing campaign ${campaign.id}: ${error.message}`);
     
-    await logActivity(supabase, campaign.id, 'connection_request', 'failed', 
-      { total: 0, successful: 0, failed: 0 }, 
-      error.message,
-      { startTime }
-    );
+    // Log failure activity
+    await logActivity(campaign.id, 'connection_request', 'failed', {
+      total: 0,
+      successful: 0,
+      failed: 0
+    }, error.message);
+    
+    throw error;
   }
 }
 
@@ -229,8 +336,20 @@ async function checkAndProcessCampaigns() {
 
     // Process each campaign that's within its time window
     for (const campaign of campaigns) {
+      // Additional validation
+      if (!campaign.timezone || !TIME_WINDOWS[campaign.timezone]) {
+        logger.warn(`Campaign ${campaign.id} has invalid timezone: ${campaign.timezone}`);
+        continue;
+      }
+
       if (!isWithinTimeWindow(campaign.timezone)) {
         logger.info(`Skipping campaign ${campaign.id} - outside of time window for ${campaign.timezone}`);
+        continue;
+      }
+
+      // Check if campaign has required configuration
+      if (!campaign.connection_request_config) {
+        logger.warn(`Campaign ${campaign.id} missing connection request configuration`);
         continue;
       }
 
@@ -251,16 +370,17 @@ async function checkAndProcessCampaigns() {
   }
 }
 
-// Schedule the task to run every hour
+// Schedule the task to run every 30 minutes
 logger.info('Starting connection request scheduler...');
-cron.schedule('0 * * * *', async () => {
-  await checkAndProcessCampaigns();
-});
+cron.schedule('*/30 * * * *', checkAndProcessCampaigns);
 
 // Export for testing
 module.exports = {
   checkAndProcessCampaigns,
   processConnectionRequests,
   getRemainingDailyLimit,
-  updateDailyConnectionCount
+  updateDailyConnectionCount,
+  // Export constants for testing
+  CONNECTION_CONFIG,
+  TIME_WINDOWS
 }; 

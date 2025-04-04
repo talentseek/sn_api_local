@@ -97,7 +97,8 @@ const sendConnectionRequestsController = (supabase) => {
         batchSize = 5, 
         delayBetweenBatches = 5000, 
         delayBetweenProfiles = 5000, 
-        sendMessage = true 
+        sendMessage = true,
+        maxRetries = 3
       } = req.body;
 
       // Validate required fields
@@ -181,6 +182,20 @@ const sendConnectionRequestsController = (supabase) => {
                   continue;
                 }
 
+                // Check if we've already tried this profile too many times
+                const { data: attempts } = await supabase
+                  .from('connection_request_attempts')
+                  .select('attempts')
+                  .eq('profile_id', profile.id)
+                  .single();
+
+                if (attempts && attempts.attempts >= maxRetries) {
+                  logger.warn(`Profile ${profile.id} has reached maximum retry attempts`);
+                  failedCount++;
+                  processedCount++;
+                  continue;
+                }
+
                 // Personalize the message if needed
                 let personalizedMessage = null;
                 if (sendMessage && campaignData?.connection_messages?.connection_request_message?.content) {
@@ -193,42 +208,89 @@ const sendConnectionRequestsController = (supabase) => {
                       job_title: profile.job_title,
                       linkedin: profile.linkedin
                     },
-                    null, // No landing page URL needed for connection requests
-                    null  // No CPD landing page URL needed for connection requests
+                    null,
+                    null
                   );
                 }
 
+                // Send the connection request
                 const result = await sendRequest(profile.linkedin, personalizedMessage);
-                
+
+                // Update profile status based on result
                 if (result.success) {
-                  if (result.status === 'pending') pendingCount++;
-                  else if (result.status === 'connected') connectedCount++;
-                  else if (result.status === 'following') followingCount++;
-                  else sentCount++;
+                  // Update profile status
+                  await supabase
+                    .from('scraped_profiles')
+                    .update({
+                      connection_status: result.status,
+                      last_connection_attempt: new Date().toISOString(),
+                      connection_error: null
+                    })
+                    .eq('id', profile.id);
+
+                  // Track the attempt
+                  await supabase
+                    .from('connection_request_attempts')
+                    .upsert({
+                      profile_id: profile.id,
+                      campaign_id: campaignId,
+                      attempts: (attempts?.attempts || 0) + 1,
+                      last_attempt: new Date().toISOString(),
+                      status: result.status,
+                      error: null
+                    });
+
+                  if (result.status === 'pending') {
+                    sentCount++;
+                  } else if (result.status === 'connected') {
+                    connectedCount++;
+                  } else if (result.status === 'following') {
+                    followingCount++;
+                  }
                 } else {
+                  // Update profile with error
+                  await supabase
+                    .from('scraped_profiles')
+                    .update({
+                      connection_status: 'failed',
+                      last_connection_attempt: new Date().toISOString(),
+                      connection_error: result.error
+                    })
+                    .eq('id', profile.id);
+
+                  // Track the failed attempt
+                  await supabase
+                    .from('connection_request_attempts')
+                    .upsert({
+                      profile_id: profile.id,
+                      campaign_id: campaignId,
+                      attempts: (attempts?.attempts || 0) + 1,
+                      last_attempt: new Date().toISOString(),
+                      status: 'failed',
+                      error: result.error
+                    });
+
                   failedCount++;
                 }
-
-                // Update profile status in database - only use allowed values
-                const dbStatus = result.success ? 
-                  (result.status === 'pending' ? 'pending' : 
-                   result.status === 'connected' ? 'connected' : 'not sent') : 
-                  'not sent';
-
-                await updateScrapedProfile(supabase, profile.id, dbStatus);
 
                 processedCount++;
                 await new Promise(resolve => setTimeout(resolve, delayBetweenProfiles));
               } catch (error) {
-                // Check for LinkedIn resistance
-                const resistanceResult = await resistanceHandler.handleResistance(campaignId, error.message);
-                if (resistanceResult) {
-                  logger.warn(`LinkedIn resistance detected (${resistanceResult.resistanceType}). Campaign ${campaignId} in cooldown until ${resistanceResult.cooldownUntil}`);
-                  throw error; // Stop processing this batch
-                }
-                
                 logger.error(`Error processing profile ${profile.id}: ${error.message}`);
                 failedCount++;
+                processedCount++;
+
+                // Track the error
+                await supabase
+                  .from('connection_request_attempts')
+                  .upsert({
+                    profile_id: profile.id,
+                    campaign_id: campaignId,
+                    attempts: (attempts?.attempts || 0) + 1,
+                    last_attempt: new Date().toISOString(),
+                    status: 'error',
+                    error: error.message
+                  });
               }
             }
 

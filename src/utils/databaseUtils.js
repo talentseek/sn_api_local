@@ -325,6 +325,67 @@ const updateScrapedProfile = async (supabase, profileId, status) => {
   }
 };
 
+/**
+ * Updates the daily connection count for a campaign with proper validation
+ * @param {string|number} campaignId - Campaign ID
+ * @param {number} connectionsToAdd - Number of connections to add
+ * @returns {Promise<Object>} Updated record
+ */
+const updateDailyConnectionCount = async (campaignId, connectionsToAdd = 0) => {
+  const logger = createLogger();
+  
+  // Input validation
+  if (!campaignId) throw new Error('Campaign ID is required');
+  
+  // Ensure campaignId is a number
+  const campaignIdNum = parseInt(campaignId, 10);
+  if (isNaN(campaignIdNum)) {
+    throw new Error('Invalid campaign ID format');
+  }
+  
+  // Validate connectionsToAdd
+  if (typeof connectionsToAdd !== 'number' || connectionsToAdd < 0) {
+    logger.warn(`Invalid connectionsToAdd value for campaign ${campaignId}: ${connectionsToAdd}`);
+    connectionsToAdd = 0;
+  }
+
+  const today = new Date().toISOString().split('T')[0];
+  
+  try {
+    // Use upsert to handle both insert and update cases
+    const { data, error } = await withTimeout(
+      supabase
+        .from('daily_connection_tracking')
+        .upsert(
+          {
+            campaign_id: campaignIdNum,
+            date: today,
+            connections_sent: connectionsToAdd,
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString()
+          },
+          {
+            onConflict: 'campaign_id,date',
+            target: ['connections_sent'],
+            update: `connections_sent = COALESCE(daily_connection_tracking.connections_sent, 0) + EXCLUDED.connections_sent`
+          }
+        )
+        .select()
+        .single(),
+      10000,
+      'Timeout while updating daily connection count'
+    );
+
+    if (error) throw error;
+
+    logger.info(`Updated daily connection count for campaign ${campaignIdNum}: ${data.connections_sent}`);
+    return data;
+  } catch (error) {
+    logger.error(`Failed to update daily connection count for campaign ${campaignIdNum}: ${error.message}`);
+    throw error;
+  }
+};
+
 module.exports = {
   insertLeads,
   insertScrapedProfiles,
@@ -332,5 +393,6 @@ module.exports = {
   withTimeout,
   normalizeLinkedInUrl,
   getScrapedProfiles,
-  updateScrapedProfile
+  updateScrapedProfile,
+  updateDailyConnectionCount,
 };
