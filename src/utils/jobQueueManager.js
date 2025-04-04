@@ -121,6 +121,28 @@ class JobQueueManager {
   getActiveJob() {
     return this.activeJob;
   }
+
+  /**
+   * Get current status of the job queue
+   * @returns {Object} Status object with queue information
+   */
+  getStatus() {
+    return {
+      queueLength: this.queue.length,
+      isProcessing: this.processing,
+      currentJob: this.processing ? {
+        type: this.activeJob?.type,
+        campaignId: this.activeJob?.campaignId,
+        startedAt: this.activeJob?.startedAt
+      } : null,
+      lastProcessedJob: this.lastProcessedJob ? {
+        type: this.lastProcessedJob.type,
+        campaignId: this.lastProcessedJob.campaignId,
+        completedAt: this.lastProcessedJob.completedAt,
+        status: this.lastProcessedJob.status
+      } : null
+    };
+  }
 }
 
 // Singleton instance

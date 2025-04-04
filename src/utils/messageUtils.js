@@ -20,14 +20,36 @@ const personalizeMessage = (template, profile, landingPageUrl = null, cpdLanding
       '{company}': profile.company || '',
       '{job_title}': profile.job_title || '',
       '{linkedin}': profile.linkedin || '',
-      '{landing_page_url}': landingPageUrl || '',
-      '{cpd_landing_page_url}': cpdLandingPageUrl || ''
+      '{landingpage}': landingPageUrl || '',
+      '{cpdlanding}': cpdLandingPageUrl || ''
     };
 
     // Replace all placeholders in the template
     Object.entries(replacements).forEach(([placeholder, value]) => {
       message = message.replace(new RegExp(placeholder, 'g'), value);
     });
+
+    // Handle custom fields if available
+    let customFields = {};
+    try {
+      if (typeof profile.personalization === 'string' && profile.personalization) {
+        logger.info(`Parsing personalization JSON for profile: ${profile.personalization}`);
+        customFields = JSON.parse(profile.personalization);
+      } else if (typeof profile.personalization === 'object' && profile.personalization !== null) {
+        logger.info(`Using personalization object for profile`);
+        customFields = profile.personalization;
+      }
+      
+      // Replace custom field placeholders
+      message = message.replace(/\{custom\.(.*?)\}/g, (match, key) => {
+        return customFields[key] ?? match;
+      });
+    } catch (error) {
+      logger.error(`Error handling custom fields: ${error.message}`);
+    }
+
+    // Ensure \n renders as newlines
+    message = message.replace(/\\n/g, '\n');
 
     return message;
   } catch (error) {

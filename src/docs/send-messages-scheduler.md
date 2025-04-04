@@ -18,12 +18,12 @@ For a campaign to be processed by the scheduler:
 - No minimum delay required
 
 ### Stage 2 (Follow-up)
-- Sent 3 days after first message
+- Sent 3 working days after first message (excludes weekends)
 - Maximum 15 messages per day
 - Only sent if no response received
 
 ### Stage 3 (Final Follow-up)
-- Sent 4 days after second message
+- Sent 3 working days after second message (excludes weekends)
 - Maximum 10 messages per day
 - Only sent if no response received
 
@@ -103,7 +103,8 @@ Example success notification:
    - Maintains conversation authenticity
 
 3. **Delay Enforcement**:
-   - Strict minimum delays between message stages
+   - Strict minimum delays between message stages using working days (Monday-Friday)
+   - Delays skip weekends and ensure next message falls on a working day
    - Helps maintain natural conversation flow
    - Reduces risk of being flagged as automated
 

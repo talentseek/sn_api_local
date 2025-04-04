@@ -23,11 +23,13 @@ if (!TELEGRAM_NOTIFICATION_CHAT_ID) {
 
 // Configuration constants
 const CHECK_SCHEDULE = {
-  runHours: [6, 9, 12, 15, 18, 21], // Every 3 hours during active hours
+  runHours: [
+    4, 6, 8, 10, 12, 14, 16, 18, 20, 22  // More frequent checks throughout the day
+  ],
   maxProfilesPerRun: 20,
   batchSize: 5,
   delayBetweenBatches: 5000,
-  minTimeBetweenChecks: 4 * 60 * 60 * 1000, // 4 hours in milliseconds
+  minTimeBetweenChecks: 3 * 60 * 60 * 1000, // Reduced to 3 hours for more frequent checks
   maxCheckAge: 7 * 24 * 60 * 60 * 1000, // 7 days in milliseconds
   cooldownPeriod: 2 * 60 * 60 * 1000 // 2 hours cooldown if we detect issues
 };
@@ -65,7 +67,17 @@ async function logActivity(campaignId, status, counts = {}, error = null, detail
         successful_count: counts.successful || 0,
         failed_count: counts.failed || 0,
         error_message: error,
-        details: details,
+        details: {
+          ...details,
+          performance: {
+            start_time: details.startTime || new Date().toISOString(),
+            end_time: status !== 'running' ? new Date().toISOString() : null,
+            processing_time_ms: details.startTime ? 
+              new Date().getTime() - new Date(details.startTime).getTime() : null,
+            avg_time_per_profile: counts.total ? 
+              (new Date().getTime() - new Date(details.startTime).getTime()) / counts.total : null
+          }
+        },
         completed_at: status !== 'running' ? new Date().toISOString() : null
       });
 
@@ -98,7 +110,6 @@ async function processConnectionChecks(campaign) {
         .eq('campaign_id', campaign.id.toString())
         .eq('connection_status', 'pending')
         .or(`last_checked.is.null,last_checked.lt.${fourHoursAgo}`)
-        .gt('connection_requested_at', sevenDaysAgo)
         .order('last_checked', { nullsFirst: true })
         .limit(CHECK_SCHEDULE.maxProfilesPerRun),
       10000,
@@ -153,16 +164,6 @@ async function processConnectionChecks(campaign) {
       notFound: result.notFound || 0
     });
 
-    // Send Telegram notification
-    const message = `✅ Connection checks completed for campaign ${campaign.id} (${campaign.name})\n` +
-                   `📊 Results:\n` +
-                   `- Total checked: ${result.totalProcessed || 0}\n` +
-                   `- Accepted: ${result.acceptedConnections || 0}\n` +
-                   `- Still pending: ${result.stillPending || 0}\n` +
-                   `- Not found: ${result.notFound || 0}`;
-    
-    await bot.sendMessage(TELEGRAM_NOTIFICATION_CHAT_ID, message);
-
   } catch (error) {
     logger.error(`Error checking connections for campaign ${campaign.id}: ${error.message}`);
     
@@ -170,11 +171,6 @@ async function processConnectionChecks(campaign) {
       { total: 0, successful: 0, failed: 0 }, 
       error.message
     );
-
-    // Send error notification
-    const errorMessage = `⚠️ Failed to check connections for campaign ${campaign.id} (${campaign.name})\n` +
-                        `Error: ${error.message}`;
-    await bot.sendMessage(TELEGRAM_NOTIFICATION_CHAT_ID, errorMessage);
   }
 }
 
@@ -193,7 +189,7 @@ async function checkAndProcessCampaigns() {
 
   isProcessing = true;
   try {
-    // Get all active campaigns
+    // Get all active campaigns with automation enabled
     const { data: campaigns, error } = await withTimeout(
       supabase
         .from('campaigns')
@@ -209,7 +205,7 @@ async function checkAndProcessCampaigns() {
     }
 
     if (!campaigns || campaigns.length === 0) {
-      logger.info('No active campaigns found');
+      logger.info('No active campaigns found with automation enabled');
       return;
     }
 
@@ -217,15 +213,14 @@ async function checkAndProcessCampaigns() {
     for (const campaign of campaigns) {
       logger.info(`Processing connection checks for campaign ${campaign.id}`);
       await processConnectionChecks(campaign);
-      
-      // Add delay between campaigns
-      await delay(5000);
+      await delay(5000); // 5 second delay between campaigns
     }
 
   } catch (error) {
     logger.error(`Error in connection check scheduler: ${error.message}`);
+    // Only notify on critical scheduler-level errors
     await bot.sendMessage(TELEGRAM_NOTIFICATION_CHAT_ID, 
-      `⚠️ Error in connection check scheduler: ${error.message}`);
+      `⚠️ Critical error in connection check scheduler: ${error.message}\nScheduler may need attention.`);
   } finally {
     isProcessing = false;
   }

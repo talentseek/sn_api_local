@@ -1,5 +1,4 @@
 const createLogger = require('../utils/logger');
-const cookieLoader = require('../modules/cookieLoader');
 const zoomHandler = require('../modules/zoomHandler');
 const sendConnectionRequestModule = require('../modules/sendConnectionRequest');
 const { withTimeout, getScrapedProfiles, updateScrapedProfile } = require('../utils/databaseUtils');
@@ -7,6 +6,8 @@ const jobQueueManager = require('../utils/jobQueueManager');
 const puppeteer = require('puppeteer');
 const { bot, sendJobStatusReport } = require('../telegramBot');
 const { personalizeMessage } = require('../utils/messageUtils');
+const ResistanceHandler = require('../utils/resistanceHandler');
+const { logActivity } = require('../utils/activityLogger');
 
 const logger = createLogger();
 
@@ -23,6 +24,50 @@ const simulateScroll = async (page) => {
   });
 };
 
+// Function to update daily connection count
+async function updateDailyConnectionCount(supabase, campaignId, connectionsToAdd) {
+  const today = new Date().toISOString().split('T')[0];
+  
+  try {
+    // First try to update existing record
+    const { data: existing, error: selectError } = await supabase
+      .from('daily_connection_tracking')
+      .select('connections_sent')
+      .eq('campaign_id', campaignId)
+      .eq('date', today)
+      .single();
+
+    if (selectError && selectError.code !== 'PGRST116') { // PGRST116 is "not found"
+      throw selectError;
+    }
+
+    if (existing) {
+      // Update existing record
+      const { error: updateError } = await supabase
+        .from('daily_connection_tracking')
+        .update({ connections_sent: existing.connections_sent + connectionsToAdd })
+        .eq('campaign_id', campaignId)
+        .eq('date', today);
+
+      if (updateError) throw updateError;
+    } else {
+      // Insert new record
+      const { error: insertError } = await supabase
+        .from('daily_connection_tracking')
+        .insert({
+          campaign_id: campaignId,
+          date: today,
+          connections_sent: connectionsToAdd
+        });
+
+      if (insertError) throw insertError;
+    }
+  } catch (error) {
+    logger.error(`Failed to update daily connection count for campaign ${campaignId}: ${error.message}`);
+    throw error;
+  }
+}
+
 /**
  * Controller for sending connection requests to LinkedIn profiles
  * @module controllers/sendConnectionRequestsController
@@ -34,6 +79,8 @@ const simulateScroll = async (page) => {
  * @returns {Function} Express route handler
  */
 const sendConnectionRequestsController = (supabase) => {
+  const resistanceHandler = new ResistanceHandler(supabase);
+
   return async (req, res) => {
     try {
       // Validate request body
@@ -61,35 +108,10 @@ const sendConnectionRequestsController = (supabase) => {
         });
       }
 
-      // Fetch campaign data to get connection message template
-      const { data: campaignData, error: campaignError } = await withTimeout(
-        supabase
-          .from('campaigns')
-          .select('connection_messages')
-          .eq('id', campaignId)
-          .single(),
-        10000,
-        'Timeout while fetching campaign data'
-      );
-
-      if (campaignError) {
-        logger.error(`Error fetching campaign data: ${campaignError.message}`);
-        return res.status(500).json({ success: false, error: 'Failed to fetch campaign data' });
-      }
-
-      // If sendMessage is true, validate that we have a template
-      if (sendMessage && (!campaignData?.connection_messages?.connection_request_message?.content)) {
-        logger.warn(`Campaign ${campaignId} has no connection message template. Proceeding without message.`);
-        // Don't return error, just continue without message
-      }
-
       // Create a job function that will be executed by the queue
       const jobFunction = async () => {
-        const browser = await puppeteer.launch({
-          headless: true,
-          args: ['--start-maximized']
-        });
-        const page = await browser.newPage();
+        let browser = null;
+        let page = null;
         
         // Initialize counters outside try block so they're accessible in catch
         let processedCount = 0;
@@ -100,44 +122,44 @@ const sendConnectionRequestsController = (supabase) => {
         let failedCount = 0;
         
         try {
-          // Set up the page with necessary configurations
-          await page.setViewport({ width: 1280, height: 800 });
-          await page.setUserAgent('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
-          
-          // Load cookies from database
-          const { cookies, error: cookieError } = await cookieLoader(supabase, { campaignId });
-          if (cookieError || !cookies) {
-            throw new Error(`Failed to load LinkedIn cookies: ${cookieError || 'No valid cookies found'}`);
-          }
-
-          // Set LinkedIn cookies
-          await page.setCookie(
-            { name: 'li_at', value: cookies.li_at, domain: '.linkedin.com' },
-            { name: 'JSESSIONID', value: cookies.li_a, domain: '.linkedin.com' }
-          );
-
-          // Get profiles to process
-          const profiles = await getScrapedProfiles(supabase, campaignId, maxProfiles);
-          if (!profiles || profiles.length === 0) {
-            throw new Error('No profiles found to process');
-          }
-
-          // Fetch campaign data to get connection message template
+          // Fetch campaign data to get cookies and message template
           const { data: campaignData, error: campaignError } = await withTimeout(
             supabase
               .from('campaigns')
-              .select('connection_messages')
+              .select('name, cookies, connection_messages')
               .eq('id', campaignId)
               .single(),
             10000,
             'Timeout while fetching campaign data'
           );
 
-          if (campaignError || !campaignData?.connection_messages?.connection_request_message?.content) {
-            throw new Error(`Failed to load connection message template: ${campaignError?.message || 'No template found'}`);
+          if (campaignError || !campaignData?.cookies) {
+            throw new Error(`Failed to load campaign data: ${campaignError?.message || 'No cookies found'}`);
           }
 
-          const messageTemplate = campaignData.connection_messages.connection_request_message.content;
+          // Initialize browser
+          browser = await puppeteer.launch({
+            headless: true,
+            args: ['--no-sandbox', '--disable-setuid-sandbox']
+          });
+
+          page = await browser.newPage();
+          await page.setViewport({ width: 1280, height: 800 });
+          await page.setUserAgent('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
+
+          // Set LinkedIn cookies
+          await page.setCookie(
+            { name: 'li_at', value: campaignData.cookies.li_at, domain: '.linkedin.com', path: '/' },
+            { name: 'li_a', value: campaignData.cookies.li_a, domain: '.linkedin.com', path: '/' }
+          );
+
+          // Get profiles to process
+          const profiles = await getScrapedProfiles(supabase, campaignId, maxProfiles);
+          
+          if (!profiles || profiles.length === 0) {
+            logger.info('No profiles to process');
+            return;
+          }
 
           // Initialize the connection request module
           const { sendRequest } = sendConnectionRequestModule(page);
@@ -159,11 +181,11 @@ const sendConnectionRequestsController = (supabase) => {
                   continue;
                 }
 
-                // Personalize the message
-                let personalizedMessage = messageTemplate;
-                if (sendMessage) {
+                // Personalize the message if needed
+                let personalizedMessage = null;
+                if (sendMessage && campaignData?.connection_messages?.connection_request_message?.content) {
                   personalizedMessage = personalizeMessage(
-                    messageTemplate,
+                    campaignData.connection_messages.connection_request_message.content,
                     {
                       first_name: profile.first_name,
                       last_name: profile.last_name,
@@ -198,9 +220,15 @@ const sendConnectionRequestsController = (supabase) => {
                 processedCount++;
                 await new Promise(resolve => setTimeout(resolve, delayBetweenProfiles));
               } catch (error) {
+                // Check for LinkedIn resistance
+                const resistanceResult = await resistanceHandler.handleResistance(campaignId, error.message);
+                if (resistanceResult) {
+                  logger.warn(`LinkedIn resistance detected (${resistanceResult.resistanceType}). Campaign ${campaignId} in cooldown until ${resistanceResult.cooldownUntil}`);
+                  throw error; // Stop processing this batch
+                }
+                
+                logger.error(`Error processing profile ${profile.id}: ${error.message}`);
                 failedCount++;
-                processedCount++;
-                logger.error(`Error processing profile ${profile.linkedin}: ${error.message}`);
               }
             }
 
@@ -225,6 +253,7 @@ const sendConnectionRequestsController = (supabase) => {
             'completed',
             {
               campaignId,
+              campaignName: campaignData.name,
               message,
               savedCount: sentCount,
               totalScraped: processedCount,
@@ -233,8 +262,27 @@ const sendConnectionRequestsController = (supabase) => {
           );
 
           logger.success(`Connection requests sending completed for job ${job.id}.`);
+
+          // After processing connections, update the activity log with results
+          await logActivity(supabase, campaignId, 'connection_request', 'success', {
+            total: processedCount,
+            successful: sentCount,
+            failed: failedCount
+          }, null, {
+            batchSize,
+            maxProfiles,
+            pendingCount,
+            connectedCount,
+            followingCount
+          });
+
+          // Update daily connection tracking
+          await updateDailyConnectionCount(supabase, campaignId, sentCount);
+
           return { success: true };
         } catch (error) {
+          // Check for resistance in any uncaught errors
+          await resistanceHandler.handleResistance(campaignId, error.message);
           logger.error(`Error processing connection requests job ${job.id}: ${error.message}`);
           
           // Send error notification
@@ -244,6 +292,7 @@ const sendConnectionRequestsController = (supabase) => {
             'failed',
             {
               campaignId,
+              campaignName: campaignData?.name,
               message: `❌ Connection requests failed for campaign ${campaignId}:\n${error.message}`,
               savedCount: sentCount,
               totalScraped: processedCount,
@@ -252,10 +301,30 @@ const sendConnectionRequestsController = (supabase) => {
             }
           );
 
+          // Log failed activity
+          await logActivity(supabase, campaignId, 'connection_request', 'failed', 
+            { total: 0, successful: 0, failed: 0 }, 
+            error.message,
+            { jobId: job.id }
+          );
+
           throw error;
         } finally {
-          await page.close();
-          await browser.close();
+          // Safely close browser and page instances
+          if (page) {
+            try {
+              await page.close();
+            } catch (e) {
+              logger.error(`Error closing page: ${e.message}`);
+            }
+          }
+          if (browser) {
+            try {
+              await browser.close();
+            } catch (e) {
+              logger.error(`Error closing browser: ${e.message}`);
+            }
+          }
         }
       };
 

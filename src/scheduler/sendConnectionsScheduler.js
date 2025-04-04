@@ -5,6 +5,7 @@ const fetch = require('node-fetch');
 const createLogger = require('../utils/logger');
 const { withTimeout } = require('../utils/databaseUtils');
 const { bot } = require('../telegramBot');
+const { logActivity } = require('../utils/activityLogger');
 
 const logger = createLogger();
 
@@ -23,9 +24,9 @@ if (!TELEGRAM_NOTIFICATION_CHAT_ID) {
 
 // Time windows for different regions (in UK time)
 const TIME_WINDOWS = {
-  'Europe': { start: 7, end: 10 },
-  'North America': { start: 13, end: 16 },
-  'Asia': { start: 0, end: 4 }
+  'Europe': { start: 7, end: 13 },
+  'North America': { start: 13, end: 19 },
+  'Asia': { start: 0, end: 6 }
 };
 
 // Utility function to add a delay
@@ -48,31 +49,6 @@ const isWithinTimeWindow = (timezone) => {
   const window = TIME_WINDOWS[timezone];
   return currentHour >= window.start && currentHour < window.end;
 };
-
-// Function to log activity
-async function logActivity(campaignId, type, status, counts = {}, error = null, details = {}) {
-  try {
-    const { data, error: logError } = await supabase
-      .from('campaign_activity_logs')
-      .insert({
-        campaign_id: campaignId,
-        activity_type: type,
-        status: status,
-        total_processed: counts.total || 0,
-        successful_count: counts.successful || 0,
-        failed_count: counts.failed || 0,
-        error_message: error,
-        details: details,
-        completed_at: status !== 'running' ? new Date().toISOString() : null
-      });
-
-    if (logError) {
-      logger.error(`Error logging activity: ${logError.message}`);
-    }
-  } catch (err) {
-    logger.error(`Failed to log activity: ${err.message}`);
-  }
-}
 
 // Function to update daily connection count
 async function updateDailyConnectionCount(campaignId, connectionsToAdd) {
@@ -144,17 +120,27 @@ async function getRemainingDailyLimit(campaignId, dailyLimit) {
 
 // Main function to process connection requests for a campaign
 async function processConnectionRequests(campaign) {
-  const activityLogId = await logActivity(campaign.id, 'connection_request', 'running');
+  const startTime = new Date().toISOString();
+  
+  // Log start of activity
+  await logActivity(supabase, campaign.id, 'connection_request', 'running', 
+    { total: 0, successful: 0, failed: 0 }, 
+    null,
+    { startTime }
+  );
   
   try {
     // Check remaining daily limit
     const remainingLimit = await getRemainingDailyLimit(campaign.id, campaign.daily_connection_limit);
     if (remainingLimit <= 0) {
       logger.info(`Daily limit reached for campaign ${campaign.id}`);
-      await logActivity(campaign.id, 'connection_request', 'success', 
+      await logActivity(supabase, campaign.id, 'connection_request', 'success', 
         { total: 0, successful: 0, failed: 0 }, 
         null, 
-        { message: 'Daily limit reached' }
+        { 
+          message: 'Daily limit reached',
+          startTime
+        }
       );
       return;
     }
@@ -184,41 +170,31 @@ async function processConnectionRequests(campaign) {
     }
 
     // Update daily count and last request time
-    await updateDailyConnectionCount(campaign.id, result.successfulRequests);
+    await updateDailyConnectionCount(campaign.id, result.sentCount);
     await supabase
       .from('campaigns')
       .update({ last_connection_request_at: new Date().toISOString() })
       .eq('id', campaign.id);
 
     // Log success
-    await logActivity(campaign.id, 'connection_request', 'success', {
+    await logActivity(supabase, campaign.id, 'connection_request', 'success', {
       total: result.totalProcessed,
-      successful: result.successfulRequests,
+      successful: result.sentCount,
       failed: result.failedRequests
+    }, null, {
+      startTime,
+      remainingLimit: remainingLimit - result.sentCount,
+      config: campaign.connection_request_config
     });
-
-    // Send Telegram notification
-    const message = `✅ Connection requests sent for campaign ${campaign.id} (${campaign.name})\n` +
-                   `📊 Results:\n` +
-                   `- Total processed: ${result.totalProcessed}\n` +
-                   `- Successful: ${result.successfulRequests}\n` +
-                   `- Failed: ${result.failedRequests}\n` +
-                   `- Remaining daily limit: ${remainingLimit - result.successfulRequests}`;
-    
-    await bot.sendMessage(TELEGRAM_NOTIFICATION_CHAT_ID, message);
 
   } catch (error) {
     logger.error(`Error processing connection requests for campaign ${campaign.id}: ${error.message}`);
     
-    await logActivity(campaign.id, 'connection_request', 'failed', 
+    await logActivity(supabase, campaign.id, 'connection_request', 'failed', 
       { total: 0, successful: 0, failed: 0 }, 
-      error.message
+      error.message,
+      { startTime }
     );
-
-    // Send error notification
-    const errorMessage = `⚠️ Failed to send connection requests for campaign ${campaign.id} (${campaign.name})\n` +
-                        `Error: ${error.message}`;
-    await bot.sendMessage(TELEGRAM_NOTIFICATION_CHAT_ID, errorMessage);
   }
 }
 
@@ -267,8 +243,9 @@ async function checkAndProcessCampaigns() {
 
   } catch (error) {
     logger.error(`Error in connection request scheduler: ${error.message}`);
+    // Only notify on critical scheduler-level errors
     await bot.sendMessage(TELEGRAM_NOTIFICATION_CHAT_ID, 
-      `⚠️ Error in connection request scheduler: ${error.message}`);
+      `⚠️ Critical error in connection request scheduler: ${error.message}\nScheduler may need attention.`);
   } finally {
     isProcessing = false;
   }

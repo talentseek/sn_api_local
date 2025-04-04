@@ -210,6 +210,31 @@ const processJob = async (currentJobId, supabase) => {
       return;
     }
 
+    // Validate message stage sequence
+    const availableStages = messages.map(m => m.stage).sort((a, b) => a - b);
+    if (messageStage > 1) {
+      const previousStageExists = availableStages.includes(messageStage - 1);
+      if (!previousStageExists) {
+        const msg = `Cannot process stage ${messageStage} - previous stage ${messageStage - 1} not found in campaign configuration`;
+        logger.error(msg);
+        await withTimeout(
+          supabase
+            .from('jobs')
+            .update({
+              status: 'failed',
+              error: msg,
+              error_category: 'invalid_stage_sequence',
+              updated_at: new Date().toISOString(),
+            })
+            .eq('job_id', currentJobId),
+          10000,
+          'Timeout while updating job status'
+        );
+        return;
+      }
+      logger.info(`Validated stage sequence: stage ${messageStage - 1} exists for current stage ${messageStage}`);
+    }
+
     // Get delay_days for the previous stage (if applicable)
     let delayDays = null;
     if (messageStage > 1) {
@@ -260,8 +285,10 @@ const processJob = async (currentJobId, supabase) => {
       leadsQuery = leadsQuery
         .eq('message_sent', false)
         .is('message_stage', null);
+      logger.info(`Fetching Stage 1 leads with no previous messages sent`);
     } else {
-      leadsQuery = leadsQuery.eq('message_stage', messageStage);
+      leadsQuery = leadsQuery.eq('message_stage', messageStage - 1);
+      logger.info(`Fetching leads for Stage ${messageStage} (looking for leads with message_stage=${messageStage - 1})`);
     }
 
     const { data: leads, error: fetchError } = await withTimeout(
@@ -309,7 +336,19 @@ const processJob = async (currentJobId, supabase) => {
     // Filter leads based on delay (for stages > 1)
     const filteredLeads = messageStage === 1
       ? leads
-      : leads.filter((lead) => hasDelayPassed(lead.last_contacted, delayDays));
+      : leads.filter((lead) => {
+          // Additional validation for lead stage progression
+          if (lead.message_stage !== messageStage - 1) {
+            logger.warn(`Lead ${lead.id} has incorrect message_stage ${lead.message_stage}, expected ${messageStage - 1}`);
+            return false;
+          }
+          return hasDelayPassed(lead.last_contacted, delayDays);
+        });
+
+    logger.info(`Found ${leads.length} total leads, ${filteredLeads.length} ready for messaging after delay check`);
+    if (messageStage > 1) {
+      logger.info(`Filtered out ${leads.length - filteredLeads.length} leads that haven't met the ${delayDays}-day delay requirement`);
+    }
 
     if (filteredLeads.length === 0) {
       logger.info(`No leads ready to message for campaign ${campaignId}, stage ${messageStage} (delay not passed)`);
@@ -387,13 +426,36 @@ const processJob = async (currentJobId, supabase) => {
             messagesSent++;
             consecutiveFailures = 0;
 
+            logger.info(`Successfully sent Stage ${messageStage} message to lead ${lead.id} (${lead.first_name} at ${lead.company})`);
+
+            // Validate current lead stage before update
+            const { data: currentLead, error: checkError } = await withTimeout(
+              supabase
+                .from('leads')
+                .select('message_stage')
+                .eq('id', lead.id)
+                .single(),
+              10000,
+              `Timeout while checking lead ${lead.id} status`
+            );
+
+            if (checkError) {
+              throw new Error(`Failed to check lead ${lead.id} status: ${checkError.message}`);
+            }
+
+            // Ensure lead stage hasn't changed during processing
+            if (messageStage > 1 && currentLead.message_stage !== messageStage - 1) {
+              logger.warn(`Lead ${lead.id} stage changed during processing from ${messageStage - 1} to ${currentLead.message_stage}, skipping update`);
+              continue;
+            }
+
             // Update the lead
             const { error: updateLeadError } = await withTimeout(
               supabase
                 .from('leads')
                 .update({
                   message_sent: true,
-                  message_stage: messageStage + 1,
+                  message_stage: messageStage,
                   last_contacted: new Date().toISOString(),
                   error: null,
                 })
@@ -405,6 +467,8 @@ const processJob = async (currentJobId, supabase) => {
             if (updateLeadError) {
               throw new Error(`Failed to update lead ${lead.id}: ${updateLeadError.message}`);
             }
+
+            logger.info(`Updated lead ${lead.id} status: message_stage=${messageStage}, last_contacted=${new Date().toISOString()}`);
           } else {
             throw new Error(result.error || 'Unknown error while sending message');
           }

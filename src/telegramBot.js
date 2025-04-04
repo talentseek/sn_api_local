@@ -134,7 +134,7 @@ const initializeBot = (supabase) => {
                 .eq('client_id', campaign.client_id)
                 .eq('message_sent', true)
                 .eq('is_open_profile', true)
-                .eq('message_stage', 2),
+                .eq('message_stage', 1),
               5000,
               `Timeout while counting leads awaiting 2nd follow-up`
             );
@@ -154,7 +154,7 @@ const initializeBot = (supabase) => {
                 .eq('client_id', campaign.client_id)
                 .eq('message_sent', true)
                 .eq('is_open_profile', true)
-                .eq('message_stage', 3),
+                .eq('message_stage', 2),
               5000,
               `Timeout while counting leads awaiting 3rd follow-up`
             );
@@ -425,8 +425,10 @@ const sendJobStatusReport = async (jobId, jobType, status, details = {}) => {
     
     let message = `${emoji} Job ${jobId} (${jobType}) ${status}\n`;
     
+    // Always include campaign ID and name together if available
     if (details.campaignId) {
-      message += `Campaign: ${details.campaignId}\n`;
+      const campaignName = details.campaignName || 'Unknown Campaign';
+      message += `Campaign: ${details.campaignId} (${campaignName})\n`;
     }
 
     // Use the summary field if available

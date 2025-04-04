@@ -14,10 +14,21 @@ The connection messages system automatically sends follow-up messages to 1st-deg
 
 ## Message Stages
 The system supports multiple message stages with configurable delays:
-- Stage 1: Initial follow-up after connection
-- Stage 2+: Subsequent follow-ups with configurable delays
+- Stage 1: Initial follow-up after connection (message_stage = null)
+- Stage 2: First follow-up (message_stage = 1, indicating Stage 1 message was sent)
+- Stage 3: Final follow-up (message_stage = 2, indicating Stage 2 message was sent)
 - Each stage can have unique message templates
-- Delays are enforced between stages (e.g., 3 days after previous message)
+- Delays are enforced between stages using working days (Monday-Friday)
+- A 3 working day delay means the next message will be sent after 3 business days, excluding weekends
+- If a delay would end on a weekend, the message is scheduled for the next working day (Monday)
+
+## Message Stage Progression
+1. New lead starts with message_stage = null
+2. After Stage 1 message sent → message_stage = 1
+3. After Stage 2 message sent → message_stage = 2
+4. After Stage 3 message sent → message_stage = 3
+
+The message_stage value indicates the most recently sent message stage.
 
 ## API Endpoint
 ```http
@@ -117,13 +128,14 @@ The system sends detailed notifications including:
 
 ## Best Practices
 1. Start with small batches (3-5 leads)
-2. Use appropriate delays between stages
+2. Use appropriate delays between stages (remember these are working days)
 3. Test message templates before running jobs
 4. Monitor Telegram notifications
 5. Check job logs for detailed information
 6. Keep message content professional and relevant
 7. Respect LinkedIn's messaging guidelines
 8. Regular monitoring of response rates
+9. Plan message sequences considering working day delays (e.g., a 3-day delay sent on Wednesday will be delivered on Monday)
 
 ## Troubleshooting
 ### Common Issues

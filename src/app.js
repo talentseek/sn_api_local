@@ -6,16 +6,14 @@ require('dotenv').config();
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 const createLogger = require('./utils/logger');
-// Import controller FACTORIES (except scrapeController)
-const scrapeController = require('./controllers/scrapeController'); // Import directly
-const scrapePremiumProfilesControllerFactory = require('./controllers/scrapePremiumProfilesController');
-const checkOpenProfilesControllerFactory = require('./controllers/checkOpenProfilesController');
+
+// Import controller FACTORIES
 const checkCookiesControllerFactory = require('./controllers/checkCookiesController');
 const sendConnectionRequestsControllerFactory = require('./controllers/sendConnectionRequestsController');
 const sendOpenProfileMessagesControllerFactory = require('./controllers/sendOpenProfileMessagesController');
 const checkConnectionRequestsControllerFactory = require('./controllers/checkConnectionRequestsController');
 const sendConnectionMessagesControllerFactory = require('./controllers/sendConnectionMessagesController');
-const scrapeCompanyDataControllerFactory = require('./controllers/scrapeCompanyDataController');
+
 // Other necessary imports
 const { initializeBot } = require('./telegramBot');
 // Simply require the scheduler file to execute it and start the cron job
@@ -62,17 +60,12 @@ initializeBot(supabase);
 
 app.use(express.json());
 
-// --- Create Controller Instances by calling the factories ---
-// REMOVE line 59 as scrapeController is imported directly
-// const scrapeController = scrapeControllerFactory(supabase);
-const scrapePremiumProfilesController = scrapePremiumProfilesControllerFactory(supabase);
-const checkOpenProfilesController = checkOpenProfilesControllerFactory(supabase); // Assuming direct export - VERIFY
-const checkCookiesController = checkCookiesControllerFactory(supabase); // Assuming direct export - VERIFY
-const sendConnectionRequestsController = sendConnectionRequestsControllerFactory(supabase); // Initialize once
-const sendOpenProfileMessagesController = sendOpenProfileMessagesControllerFactory(supabase); // Assuming direct export - VERIFY
-const checkConnectionRequestsController = checkConnectionRequestsControllerFactory(supabase); // Assuming direct export - VERIFY
-const sendConnectionMessagesController = sendConnectionMessagesControllerFactory(supabase); // Assuming direct export - VERIFY
-const scrapeCompanyDataController = scrapeCompanyDataControllerFactory(supabase);
+// Initialize controllers with supabase instance
+const checkCookiesController = checkCookiesControllerFactory(supabase);
+const sendConnectionRequestsController = sendConnectionRequestsControllerFactory(supabase);
+const sendOpenProfileMessagesController = sendOpenProfileMessagesControllerFactory(supabase);
+const checkConnectionRequestsController = checkConnectionRequestsControllerFactory(supabase);
+const sendConnectionMessagesController = sendConnectionMessagesControllerFactory(supabase);
 
 /**
  * API Routes for LinkedIn automation operations
@@ -80,64 +73,64 @@ const scrapeCompanyDataController = scrapeCompanyDataControllerFactory(supabase)
  */
 
 /**
- * Scrape profiles from LinkedIn Sales Navigator search results
- * @route POST /api/scrape
- */
-// Wrap the handler to explicitly pass the supabase instance
-app.post('/api/scrape', (req, res) => {
-  // Now we call addScrapeJob with the correct arguments: req, res, and the supabase client
-  scrapeController.addScrapeJob(req, res, supabase);
-});
-
-/**
- * Scrape detailed information from premium profiles
- * @route POST /api/scrape-premium-profiles
- */
-// Uses the controller instance created via factory
-app.post('/api/scrape-premium-profiles', scrapePremiumProfilesController);
-
-/**
- * Check which profiles allow open messaging without a connection
- * @route POST /api/check-open-profiles
- */
-app.post('/api/check-open-profiles', checkOpenProfilesController);
-
-/**
  * Verify that LinkedIn cookies are still valid
  * @route POST /api/check-cookies
  */
-app.post('/api/check-cookies', checkCookiesController);
+app.post('/api/check-cookies', async (req, res, next) => {
+  try {
+    await checkCookiesController(req, res);
+  } catch (error) {
+    next(error);
+  }
+});
 
 /**
  * Send connection requests to specified profiles
  * @route POST /api/send-connection-requests
  */
-app.post('/api/send-connection-requests', sendConnectionRequestsController); // Use the initialized controller
+app.post('/api/send-connection-requests', async (req, res, next) => {
+  try {
+    await sendConnectionRequestsController(req, res);
+  } catch (error) {
+    next(error);
+  }
+});
 
 /**
  * Send messages to open profiles that don't require a connection
  * @route POST /api/send-open-profile-messages
  */
-app.post('/api/send-open-profile-messages', sendOpenProfileMessagesController);
+app.post('/api/send-open-profile-messages', async (req, res, next) => {
+  try {
+    await sendOpenProfileMessagesController(req, res);
+  } catch (error) {
+    next(error);
+  }
+});
 
 /**
  * Check the status of previously sent connection requests
  * @route POST /api/check-connection-requests
  */
-app.post('/api/check-connection-requests', checkConnectionRequestsController);
+app.post('/api/check-connection-requests', async (req, res, next) => {
+  try {
+    await checkConnectionRequestsController(req, res);
+  } catch (error) {
+    next(error);
+  }
+});
 
 /**
  * Send messages to accepted connections
  * @route POST /api/send-connection-messages
  */
-app.post('/api/send-connection-messages', sendConnectionMessagesController);
-
-/**
- * Scrape company data from LinkedIn
- * @route POST /api/scrape-company-data
- */
-// Uses the controller instance created via factory
-app.post('/api/scrape-company-data', scrapeCompanyDataController);
+app.post('/api/send-connection-messages', async (req, res, next) => {
+  try {
+    await sendConnectionMessagesController(req, res);
+  } catch (error) {
+    next(error);
+  }
+});
 
 // Start the server
 const PORT = process.env.PORT || 8080;
@@ -146,8 +139,39 @@ app.listen(PORT, () => {
 });
 
 // Health check endpoint
-app.get('/health', (req, res) => {
-  res.status(200).send('OK');
+app.get('/health', async (req, res) => {
+  try {
+    // Check database connection
+    const { data, error } = await supabase
+      .from('campaigns')
+      .select('id')
+      .limit(1);
+    
+    if (error) {
+      return res.status(500).json({
+        status: 'error',
+        database: 'error',
+        message: 'Database connection failed',
+        timestamp: new Date().toISOString()
+      });
+    }
+
+    // Check job queue status
+    const queueStatus = jobQueueManager.getStatus();
+
+    res.status(200).json({
+      status: 'healthy',
+      database: 'connected',
+      jobQueue: queueStatus,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    res.status(500).json({
+      status: 'error',
+      message: error.message,
+      timestamp: new Date().toISOString()
+    });
+  }
 });
 
 // Graceful shutdown
@@ -162,3 +186,5 @@ process.on('SIGINT', () => {
   // Add cleanup logic here if needed
   process.exit(0);
 });
+
+module.exports = app;

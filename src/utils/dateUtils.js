@@ -20,11 +20,17 @@ const addWorkingDays = (startDate, days) => {
   return currentDate;
 };
 
-// Utility function to check if the delay period has passed
+// Utility function to check if the delay period has passed using working days
 const hasDelayPassed = (lastContacted, delayDays) => {
-  if (!lastContacted || !delayDays) return true; // No delay check for stage 1
-  const requiredDate = addWorkingDays(new Date(lastContacted), delayDays);
-  return new Date() >= requiredDate;
+  if (!lastContacted) return false; // If never contacted, delay hasn't passed (for stages > 1)
+  if (!delayDays || delayDays <= 0) return true; // No delay required or stage 1
+  
+  const lastContactedDate = new Date(lastContacted);
+  // Calculate the date when the lead is eligible for the next message using working days
+  const eligibleDate = addWorkingDays(lastContactedDate, delayDays);
+  
+  // Check if the current date is on or after the eligible date
+  return new Date() >= eligibleDate;
 };
 
 module.exports = {

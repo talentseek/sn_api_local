@@ -1,9 +1,12 @@
 const createLogger = require('../utils/logger');
+const logger = createLogger();
 const { withTimeout } = require('../utils/databaseUtils');
 const { hasDelayPassed } = require('../utils/dateUtils');
 const messageConnectionModule = require('../modules/messageConnection');
-const { bot } = require('../telegramBot');
+const { bot, sendJobStatusReport } = require('../telegramBot');
 const jobQueueManager = require('../utils/jobQueueManager');
+const { personalizeMessage } = require('../utils/messageUtils');
+const { logActivity } = require('../utils/activityLogger');
 
 // Function to construct landing page URL in `{firstNameLastInitial}.{companySlug}` format
 const constructLandingPageURL = (lead) => {
@@ -42,103 +45,44 @@ const constructCPDLandingPageURL = (lead) => {
   return `https://costperdemo.com/${firstName}${lastInitial}.${companySlug}`;
 };
 
-/**
- * Personalizes a message template with lead data and custom fields
- * @param {string} template - The message template
- * @param {Object} lead - The lead object
- * @param {string} landingPageURL - The landing page URL
- * @param {string} cpdLandingPageURL - The CPD landing page URL
- * @returns {string} - The personalized message
- */
-const personalizeMessage = (template, lead, landingPageURL, cpdLandingPageURL) => {
-  const logger = createLogger();
-  
-  // Replace basic placeholders
-  let personalizedMessage = template
-    .replace(/{first_name}/g, lead.first_name || 'there')
-    .replace(/{last_name}/g, lead.last_name || '')
-    .replace(/{company}/g, lead.company || 'your company')
-    .replace(/{position}/g, lead.position || 'professional')
-    .replace(/{landingpage}/g, landingPageURL)
-    .replace(/{cpdlanding}/g, cpdLandingPageURL);
-  
-  // Parse personalization JSON safely
-  let customFields = {};
-  try {
-    if (typeof lead.personalization === 'string' && lead.personalization) {
-      logger.info(`Parsing personalization JSON for lead ${lead.id}: ${lead.personalization}`);
-      customFields = JSON.parse(lead.personalization);
-    } else if (typeof lead.personalization === 'object' && lead.personalization !== null) {
-      logger.info(`Using personalization object for lead ${lead.id}`);
-      customFields = lead.personalization;
-    }
-    
-    // Log the parsed custom fields
-    logger.info(`Custom fields for lead ${lead.id}: ${JSON.stringify(customFields)}`);
-  } catch (error) {
-    logger.error(`Error parsing personalization JSON for lead ${lead.id}: ${error.message}`);
-  }
-  
-  // Replace custom field placeholders using the same pattern as your working code
-  personalizedMessage = personalizedMessage.replace(/\{custom\.(.*?)\}/g, (match, key) => {
-    return customFields[key] ?? match;
-  });
-  
-  // Ensure \n renders as newlines
-  personalizedMessage = personalizedMessage.replace(/\\n/g, '\n');
-  
-  return personalizedMessage;
-};
-
 // Random delay between min and max milliseconds
 const randomDelay = (min, max) =>
   new Promise((resolve) => setTimeout(resolve, Math.floor(Math.random() * (max - min + 1)) + min));
 
 // Process the job asynchronously
 const processJob = async (currentJobId, supabase) => {
-  const logger = createLogger();
+  const startTime = new Date().toISOString();
   let messageSender = null;
 
   try {
-    // Fetch job data
-    const { data: jobData, error: jobFetchError } = await withTimeout(
+    // Get job details
+    const { data: jobData, error: jobError } = await withTimeout(
       supabase
         .from('jobs')
         .select('*')
         .eq('job_id', currentJobId)
         .single(),
       10000,
-      'Timeout while fetching job data'
+      'Timeout while fetching job'
     );
 
-    if (jobFetchError || !jobData) {
-      logger.error(`Failed to fetch job ${currentJobId}: ${jobFetchError?.message}`);
+    if (jobError || !jobData) {
+      logger.error(`Failed to fetch job ${currentJobId}: ${jobError?.message}`);
       return;
     }
 
     const campaignId = parseInt(jobData.campaign_id);
     const messageStage = jobData.result?.message_stage;
-    if (!messageStage) {
-      const msg = `Message stage not found in job ${currentJobId} result`;
-      logger.error(msg);
-      await withTimeout(
-        supabase
-          .from('jobs')
-          .update({
-            status: 'failed',
-            error: msg,
-            error_category: 'missing_message_stage',
-            updated_at: new Date().toISOString(),
-          })
-          .eq('job_id', currentJobId),
-        10000,
-        'Timeout while updating job status'
-      );
-      return;
-    }
-
+    const delayDays = jobData.result?.delay_days;
     const totalMessages = jobData.max_profiles;
     const batchSize = jobData.batch_size;
+    
+    // Log activity start
+    await logActivity(supabase, campaignId, 'message_sent', 'running', 
+      { total: 0, successful: 0, failed: 0 }, 
+      null,
+      { startTime, messageStage }
+    );
 
     // Update job status to started
     const { error: updateStartError } = await withTimeout(
@@ -210,11 +154,29 @@ const processJob = async (currentJobId, supabase) => {
       return;
     }
 
-    // Get delay_days for the previous stage (if applicable)
-    let delayDays = null;
+    // Validate message stage sequence
+    const availableStages = messages.map(m => m.stage).sort((a, b) => a - b);
     if (messageStage > 1) {
-      const previousMessage = messages.find((msg) => msg.stage === messageStage - 1);
-      delayDays = previousMessage?.delay_days || 0;
+      const previousStageExists = availableStages.includes(messageStage - 1);
+      if (!previousStageExists) {
+        const msg = `Cannot process stage ${messageStage} - previous stage ${messageStage - 1} not found in campaign configuration`;
+        logger.error(msg);
+        await withTimeout(
+          supabase
+            .from('jobs')
+            .update({
+              status: 'failed',
+              error: msg,
+              error_category: 'invalid_stage_sequence',
+              updated_at: new Date().toISOString(),
+            })
+            .eq('job_id', currentJobId),
+          10000,
+          'Timeout while updating job status'
+        );
+        return;
+      }
+      logger.info(`Validated stage sequence: stage ${messageStage - 1} exists for current stage ${messageStage}`);
     }
 
     // Fetch client data for landing page URLs
@@ -252,7 +214,7 @@ const processJob = async (currentJobId, supabase) => {
       .from('leads')
       .select('id, first_name, last_name, company, linkedin, position, client_id, message_stage, last_contacted, personalization')
       .eq('client_id', campaignData.client_id)
-      .eq('connection_level', '1st') // Use connection_level instead of connection_status
+      .eq('connection_level', '1st')
       .eq('status', 'not_replied')
       .limit(totalMessages);
 
@@ -260,8 +222,10 @@ const processJob = async (currentJobId, supabase) => {
       leadsQuery = leadsQuery
         .eq('message_sent', false)
         .is('message_stage', null);
+      logger.info(`Fetching Stage 1 leads with no previous messages sent`);
     } else {
-      leadsQuery = leadsQuery.eq('message_stage', messageStage);
+      leadsQuery = leadsQuery.eq('message_stage', messageStage - 1);
+      logger.info(`Fetching leads for Stage ${messageStage} (looking for leads with message_stage=${messageStage - 1})`);
     }
 
     const { data: leads, error: fetchError } = await withTimeout(
@@ -309,7 +273,25 @@ const processJob = async (currentJobId, supabase) => {
     // Filter leads based on delay (for stages > 1)
     const filteredLeads = messageStage === 1
       ? leads
-      : leads.filter((lead) => hasDelayPassed(lead.last_contacted, delayDays));
+      : leads.filter((lead) => {
+          // Additional validation for lead stage progression
+          if (lead.message_stage !== messageStage - 1) {
+            logger.warn(`Lead ${lead.id} has incorrect message_stage ${lead.message_stage}, expected ${messageStage - 1}`);
+            return false;
+          }
+          
+          // Use hasDelayPassed to check working days delay with the delay passed from scheduler
+          const hasDelay = hasDelayPassed(lead.last_contacted, delayDays);
+          if (!hasDelay) {
+            logger.info(`Lead ${lead.id} hasn't met the ${delayDays} working days delay requirement (last contacted: ${lead.last_contacted})`);
+          }
+          return hasDelay;
+        });
+
+    logger.info(`Found ${leads.length} total leads, ${filteredLeads.length} ready for messaging after delay check`);
+    if (messageStage > 1) {
+      logger.info(`Filtered out ${leads.length - filteredLeads.length} leads that haven't met the ${delayDays}-working-day delay requirement`);
+    }
 
     if (filteredLeads.length === 0) {
       logger.info(`No leads ready to message for campaign ${campaignId}, stage ${messageStage} (delay not passed)`);
@@ -348,6 +330,7 @@ const processJob = async (currentJobId, supabase) => {
 
       for (const lead of batch) {
         logger.info(`Sending message to ${lead.first_name} at ${lead.company}`);
+        processedLeads++;
 
         // Construct landing page URLs
         const landingPageURL = constructURLWithSubdomain(lead, clientData);
@@ -386,13 +369,36 @@ const processJob = async (currentJobId, supabase) => {
             messagesSent++;
             consecutiveFailures = 0;
 
+            logger.info(`Successfully sent Stage ${messageStage} message to lead ${lead.id} (${lead.first_name} at ${lead.company})`);
+
+            // Validate current lead stage before update
+            const { data: currentLead, error: checkError } = await withTimeout(
+              supabase
+                .from('leads')
+                .select('message_stage')
+                .eq('id', lead.id)
+                .single(),
+              10000,
+              `Timeout while checking lead ${lead.id} status`
+            );
+
+            if (checkError) {
+              throw new Error(`Failed to check lead ${lead.id} status: ${checkError.message}`);
+            }
+
+            // Ensure lead stage hasn't changed during processing
+            if (messageStage > 1 && currentLead.message_stage !== messageStage - 1) {
+              logger.warn(`Lead ${lead.id} stage changed during processing from ${messageStage - 1} to ${currentLead.message_stage}, skipping update`);
+              continue;
+            }
+
             // Update the lead
             const { error: updateLeadError } = await withTimeout(
               supabase
                 .from('leads')
                 .update({
                   message_sent: true,
-                  message_stage: messageStage + 1,
+                  message_stage: messageStage,
                   last_contacted: new Date().toISOString(),
                   error: null,
                 })
@@ -404,6 +410,8 @@ const processJob = async (currentJobId, supabase) => {
             if (updateLeadError) {
               throw new Error(`Failed to update lead ${lead.id}: ${updateLeadError.message}`);
             }
+
+            logger.info(`Updated lead ${lead.id} status: message_stage=${messageStage}, last_contacted=${new Date().toISOString()}`);
           } else {
             throw new Error(result.error || 'Unknown error while sending message');
           }
@@ -453,18 +461,19 @@ const processJob = async (currentJobId, supabase) => {
     }
 
     // Update job status
-    const { error: updateJobError } = await withTimeout(
+    await withTimeout(
       supabase
         .from('jobs')
         .update({
           status: 'completed',
-          progress: messagesSent / totalLeads,
+          progress: 1,
           result: {
-            message: messagesSent > 0 ? 'Messages sent successfully' : 'No messages sent',
+            message: 'Messages sent successfully',
             message_stage: messageStage,
-            total_messages: totalLeads,
-            messages_sent: messagesSent,
-            failed_messages: failedMessages,
+            totalProcessed: processedLeads,
+            successfulMessages: messagesSent,
+            failedMessages: failedMessages.length,
+            skippedResponded: totalLeads - processedLeads
           },
           updated_at: new Date().toISOString(),
         })
@@ -472,10 +481,6 @@ const processJob = async (currentJobId, supabase) => {
       10000,
       'Timeout while updating job status'
     );
-
-    if (updateJobError) {
-      logger.error(`Failed to update job ${currentJobId} to completed: ${updateJobError.message}`);
-    }
 
     // Send notification to Telegram
     try {
@@ -493,22 +498,76 @@ const processJob = async (currentJobId, supabase) => {
     } catch (telegramError) {
       logger.error(`Failed to send Telegram notification: ${telegramError.message}`);
     }
+
+    // After sending messages, update the activity log with results
+    await logActivity(supabase, campaignId, 'message_sent', 'success', {
+      total: processedLeads,
+      successful: messagesSent,
+      failed: failedMessages.length
+    }, null, {
+      startTime,
+      messageStage,
+      remainingDaily: result.remainingDaily,
+      skippedResponded: totalLeads - processedLeads,
+      performance: {
+        avgTimePerLead: processedLeads ? 
+          (new Date().getTime() - new Date(startTime).getTime()) / processedLeads : null
+      }
+    });
+
+    return {
+      success: true,
+      message: `Successfully processed ${messagesSent} messages for campaign ${campaignId}`,
+      messagesSent,
+      failedMessages
+    };
   } catch (error) {
-    logger.error(`Failed to process job ${currentJobId}: ${error.message}`);
+    logger.error(`Error processing message sending job ${currentJobId}: ${error.message}`);
+    
+    // Log failed activity
+    await logActivity(supabase, campaignId, 'message_sent', 'failed', 
+      { total: 0, successful: 0, failed: 0 }, 
+      error.message,
+      { startTime, messageStage, jobId: currentJobId }
+    );
+
+    throw error;
+  } finally {
+    // Ensure browser is properly closed
+    if (messageSender?.browser) {
+      try {
+        await messageSender.browser.close();
+      } catch (closeError) {
+        logger.warn(`Error closing browser: ${closeError.message}`);
+      }
+    }
+  }
+};
+
+// Error handling middleware
+const handleError = async (err, jobId, supabase) => {
+  logger.error(`Queue processing failed for job ${jobId}: ${err.message}`);
+  try {
     await withTimeout(
       supabase
         .from('jobs')
         .update({
           status: 'failed',
-          error: error.message,
-          error_category: 'job_processing_failed',
+          error: err.message,
+          error_category: 'queue_processing_failed',
           updated_at: new Date().toISOString(),
         })
-        .eq('job_id', currentJobId),
+        .eq('job_id', jobId),
       10000,
       'Timeout while updating job status'
     );
+  } catch (updateError) {
+    logger.error(`Failed to update job status: ${updateError.message}`);
   }
+  return {
+    success: false,
+    error: err.message
+  };
 };
 
 module.exports = (supabase) => {
@@ -561,16 +620,14 @@ module.exports = (supabase) => {
       res.json({ success: true, jobId });
 
       // Process the job asynchronously
-      // Add job to queue
       jobQueueManager.addJob(
         () => processJob(jobId, supabase),
         { jobId, type: 'send_connection_messages', campaignId }
       ).catch(err => {
-        logger.error(`Queue processing failed for job ${jobId}: ${err.message}`);
+        handleError(err, jobId, supabase);
       });
 
     } catch (error) {
-      const logger = createLogger();
       logger.error(`Error in /send-connection-messages route: ${error.message}`);
       if (jobId) {
         await withTimeout(
@@ -587,6 +644,14 @@ module.exports = (supabase) => {
           'Timeout while updating job status'
         );
       }
+
+      // Log failed activity
+      await logActivity(supabase, campaignId, 'message_sent', 'failed', 
+        { total: 0, successful: 0, failed: 0 }, 
+        error.message,
+        { startTime: new Date().toISOString(), messageStage, jobId }
+      );
+
       return res.status(500).json({ success: false, error: error.message });
     }
   };

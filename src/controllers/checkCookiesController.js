@@ -4,10 +4,10 @@
  */
 
 const createLogger = require('../utils/logger');
-const cookieLoader = require('../modules/cookieLoader');
 const lightCookieChecker = require('../modules/lightCookieChecker');
 const { withTimeout } = require('../utils/databaseUtils');
 const jobQueueManager = require('../utils/jobQueueManager');
+const puppeteer = require('puppeteer');
 
 const logger = createLogger();
 
@@ -17,6 +17,87 @@ const randomDelay = (attempt) => {
   const delay = baseDelay * Math.pow(2, attempt - 1); // Exponential backoff: 5s, 10s, 20s
   const jitter = Math.random() * 2000; // Add up to 2s of jitter
   return delay + jitter;
+};
+
+/**
+ * Validates LinkedIn cookies using Puppeteer
+ * @param {Array} cookies - Array of cookie objects
+ * @returns {Promise<{isValid: boolean, message: string}>}
+ */
+const validateCookiesWithPuppeteer = async (cookies) => {
+  let browser = null;
+  let page = null;
+
+  try {
+    browser = await puppeteer.launch({
+      headless: true,
+      args: ['--no-sandbox', '--disable-setuid-sandbox']
+    });
+
+    page = await browser.newPage();
+    await page.setViewport({ width: 1280, height: 800 });
+    await page.setUserAgent('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
+
+    // Set cookies
+    await page.setCookie(...cookies);
+
+    // First try Sales Navigator
+    logger.info('Attempting to validate cookies with Sales Navigator...');
+    await page.goto('https://www.linkedin.com/sales', { 
+      waitUntil: ['domcontentloaded', 'networkidle0'],
+      timeout: 30000 
+    });
+
+    const currentUrl = page.url();
+    if (currentUrl.includes('linkedin.com/sales/login')) {
+      // If Sales Navigator fails, try regular LinkedIn
+      logger.info('Sales Navigator login failed, trying regular LinkedIn...');
+      await page.goto('https://www.linkedin.com/feed/', { 
+        waitUntil: ['domcontentloaded', 'networkidle0'],
+        timeout: 30000 
+      });
+
+      const regularUrl = page.url();
+      if (regularUrl.includes('linkedin.com/login')) {
+        return { isValid: false, message: 'Cookies are invalid for both Sales Navigator and regular LinkedIn.' };
+      }
+    }
+
+    // Check for common LinkedIn elements that indicate we're logged in
+    const validSelectors = [
+      'div[data-test-id="nav-search-typeahead"]', // Sales Nav search
+      '#global-nav', // Regular LinkedIn nav
+      '.feed-identity-module', // LinkedIn feed module
+      '.search-global-typeahead', // LinkedIn search
+      '.authentication-outlet', // General LinkedIn authenticated container
+      '.application-outlet', // Another common LinkedIn container
+      '.nav-search-typeahead' // Alternative search selector
+    ];
+
+    let foundSelector = null;
+    for (const selector of validSelectors) {
+      try {
+        const element = await page.waitForSelector(selector, { timeout: 5000 });
+        if (element) {
+          foundSelector = selector;
+          break;
+        }
+      } catch (e) {
+        continue;
+      }
+    }
+
+    if (!foundSelector) {
+      return { isValid: false, message: 'Unable to validate page access: No LinkedIn elements found.' };
+    }
+
+    return { isValid: true, message: 'Cookies are valid.' };
+  } catch (error) {
+    return { isValid: false, message: `Failed to validate cookies: ${error.message}` };
+  } finally {
+    if (page) await page.close().catch(() => {});
+    if (browser) await browser.close().catch(() => {});
+  }
 };
 
 /**
@@ -162,8 +243,8 @@ module.exports = (supabase) => {
           }
 
           const cookies = [
-            { name: 'li_a', value: campaignData.cookies.li_a, domain: '.linkedin.com' },
-            { name: 'li_at', value: campaignData.cookies.li_at, domain: '.linkedin.com' },
+            { name: 'li_a', value: campaignData.cookies.li_a, domain: '.linkedin.com', path: '/' },
+            { name: 'li_at', value: campaignData.cookies.li_at, domain: '.linkedin.com', path: '/' }
           ];
 
           // First, try the lightweight cookie check
@@ -179,36 +260,28 @@ module.exports = (supabase) => {
             const maxRetries = 5;
 
             for (let attempt = 1; attempt <= maxRetries; attempt++) {
-              let browser = null;
-              let page = null;
-
               try {
                 logger.info(`Attempt ${attempt}/${maxRetries}: Validating cookies for campaign ${campaignId}`);
                 logger.info(`Cookies being validated: ${JSON.stringify(cookies.map(c => ({ name: c.name, domain: c.domain })))}`);
-                const { browser: loadedBrowser, page: loadedPage } = await cookieLoader({
-                  cookies,
-                  searchUrl: 'https://www.linkedin.com/sales/home',
-                });
-                browser = loadedBrowser;
-                page = loadedPage;
+                
+                const result = await validateCookiesWithPuppeteer(cookies);
 
-                validationResult = 'Cookies are valid';
-                cookiesStatus = 'valid';
-                logger.success(`Cookies validated successfully for campaign ${campaignId}`);
-                break;
-              } catch (error) {
-                logger.error(`Attempt ${attempt}/${maxRetries} failed: ${error.message}`);
-                if (error.message.includes('CAPTCHA detected')) {
+                if (result.isValid) {
+                  validationResult = 'Cookies are valid';
+                  cookiesStatus = 'valid';
+                  logger.success(`Cookies validated successfully for campaign ${campaignId}`);
+                  break;
+                } else if (result.message.includes('CAPTCHA')) {
                   cookiesStatus = 'manual_intervention_required';
                   validationResult = 'CAPTCHA detected. Manual intervention required.';
                   break;
-                } else if (error.message.includes('Two-factor authentication required')) {
+                } else if (result.message.includes('Two-factor')) {
                   cookiesStatus = 'manual_intervention_required';
                   validationResult = 'Two-factor authentication required.';
                   break;
                 }
 
-                validationResult = `Failed to validate cookies: ${error.message}`;
+                validationResult = `Failed to validate cookies: ${result.message}`;
                 cookiesStatus = 'invalid';
 
                 if (attempt === maxRetries) {
@@ -218,13 +291,11 @@ module.exports = (supabase) => {
                   logger.info(`Retrying in ${Math.round(delay/1000)} seconds...`);
                   await new Promise(resolve => setTimeout(resolve, delay));
                 }
-              } finally {
-                try {
-                  if (page) await page.close();
-                  if (browser) await browser.close();
-                  logger.info(`Closed browser and page for attempt ${attempt}`);
-                } catch (err) {
-                  logger.error(`Failed to close browser or page for attempt ${attempt}: ${err.message}`);
+              } catch (error) {
+                logger.error(`Attempt ${attempt}/${maxRetries} failed: ${error.message}`);
+                if (attempt === maxRetries) {
+                  validationResult = `Failed to validate cookies after ${maxRetries} attempts: ${error.message}`;
+                  cookiesStatus = 'invalid';
                 }
               }
             }

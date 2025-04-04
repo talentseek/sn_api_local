@@ -3,6 +3,9 @@ const { withTimeout } = require('../utils/databaseUtils');
 const checkConnectionRequestsModule = require('../modules/checkConnectionRequests');
 const { bot, sendJobStatusReport } = require('../telegramBot');
 const jobQueueManager = require('../utils/jobQueueManager');
+const { logActivity } = require('../utils/activityLogger');
+
+const logger = createLogger();
 
 // Random delay between min and max milliseconds
 const randomDelay = (min, max) =>
@@ -10,10 +13,34 @@ const randomDelay = (min, max) =>
 
 // Process the job asynchronously
 const processJob = async (currentJobId, supabase) => {
-  const logger = createLogger();
+  const startTime = new Date().toISOString();
   let connectionChecker = null;
+  let page = null;
+  let browser = null;
 
   try {
+    // Get job details
+    const { data: job, error: jobError } = await withTimeout(
+      supabase
+        .from('jobs')
+        .select('*')
+        .eq('job_id', currentJobId)
+        .single(),
+      10000,
+      'Timeout while fetching job'
+    );
+
+    if (jobError) throw new Error(`Failed to fetch job: ${jobError.message}`);
+    
+    const campaignId = job.campaign_id;
+    
+    // Log activity start
+    await logActivity(supabase, campaignId, 'connection_check', 'running', 
+      { total: 0, successful: 0, failed: 0 }, 
+      null,
+      { startTime }
+    );
+
     // Fetch job data
     const { data: jobData, error: jobFetchError } = await withTimeout(
       supabase
@@ -30,7 +57,6 @@ const processJob = async (currentJobId, supabase) => {
       return;
     }
 
-    const campaignId = parseInt(jobData.campaign_id);
     const maxProfiles = jobData.max_profiles;
     const batchSize = jobData.batch_size;
 
@@ -364,19 +390,79 @@ const processJob = async (currentJobId, supabase) => {
 
         // Small delay between profiles within a batch
         if (batch.indexOf(profile) < batch.length - 1) {
-          logger.info(`Waiting 1-2 seconds before the next profile...`);
-          await randomDelay(1000, 2000);
+          logger.info('Waiting between profile checks...');
+          await randomDelay(1000, 3000);
         }
       }
 
-      // Delay between batches
+      // Small delay between batches
       if (i + batchSize < profiles.length) {
-        logger.info(`Waiting 5-10 seconds before the next batch...`);
-        await randomDelay(5000, 10000);
+        logger.info('Waiting between batches...');
+        await randomDelay(3000, 5000);
       }
     }
 
-    logger.success(`Connection request check completed for job ${currentJobId}.`);
+    // Log final activity
+    const endTime = new Date().toISOString();
+    const duration = new Date(endTime) - new Date(startTime);
+    const avgTimePerProfile = duration / processedProfiles;
+
+    await logActivity(supabase, campaignId, 'connection_check', 'success', 
+      { 
+        total: processedProfiles,
+        successful: profilesAccepted,
+        failed: failedChecks.length
+      },
+      null,
+      {
+        profilesAccepted,
+        profilesMovedToLeads,
+        failedChecks,
+        duration,
+        avgTimePerProfile,
+        startTime,
+        endTime
+      }
+    );
+
+    // Get campaign name for reporting
+    const { data: campaignNameData, error: campaignNameError } = await withTimeout(
+      supabase
+        .from('campaigns')
+        .select('name')
+        .eq('id', campaignId)
+        .single(),
+      10000,
+      'Timeout while fetching campaign name'
+    );
+
+    if (campaignNameError) {
+      logger.warn(`Could not fetch campaign name: ${campaignNameError.message}`);
+    }
+
+    // Send job completion report
+    const message = `Connection checks completed for campaign ${campaignId}:\n` +
+      `✅ Total Processed: ${totalProfiles}\n` +
+      `🤝 Accepted: ${profilesAccepted}\n` +
+      `📥 Moved to Leads: ${profilesMovedToLeads}\n` +
+      `❌ Failed Checks: ${failedChecks.length}`;
+
+    await sendJobStatusReport(
+      currentJobId,
+      'check',
+      'completed',
+      {
+        campaignId,
+        campaignName: campaignNameData?.name,
+        message,
+        totalChecked: totalProfiles,
+        acceptedCount: profilesAccepted,
+        movedToLeadsCount: profilesMovedToLeads,
+        failedCount: failedChecks.length
+      }
+    );
+
+    // Update job status to completed
     await withTimeout(
       supabase
         .from('jobs')
@@ -384,7 +470,7 @@ const processJob = async (currentJobId, supabase) => {
           status: 'completed',
           progress: 1,
           result: {
-            totalProfilesChecked: totalProfiles,
+            totalProfilesChecked: processedProfiles,
             profilesAccepted,
             profilesMovedToLeads,
             failedChecks,
@@ -393,164 +479,156 @@ const processJob = async (currentJobId, supabase) => {
         })
         .eq('job_id', currentJobId),
       10000,
-      'Timeout while updating job status to completed'
+      'Timeout while updating job status'
     );
 
-    // Send success notification to Telegram
-    await sendJobStatusReport(
-      currentJobId,
-      'check_connection_requests',
-      'completed',
-      {
-        campaignId: campaignId,
-        totalProcessed: totalProfiles,
-        newConnected: profilesAccepted,
-        alreadyConnected: profilesMovedToLeads,
-        pending: totalProfiles - profilesAccepted - profilesMovedToLeads,
-        failed: failedChecks.length,
-        summary: `📊 Connection Check Results for Campaign ${campaignId}:
-• Total Profiles Checked: ${totalProfiles}
-• Still Pending: ${totalProfiles - profilesAccepted - profilesMovedToLeads}
-• Newly Connected: ${profilesAccepted}
-• Moved to Leads: ${profilesMovedToLeads}
-${failedChecks.length > 0 ? `• Failed Checks: ${failedChecks.length}
-• Failed Profiles: ${failedChecks.map(f => f.profileId).join(', ')}` : ''}`
-      }
-    );
+    logger.info(`Job ${currentJobId} completed successfully`);
   } catch (error) {
-    logger.error(`Error in job ${currentJobId}: ${error.message}`);
-    let errorCategory = 'unknown';
-    if (error.message.includes('Cookies are invalid')) {
-      errorCategory = 'authentication_failed';
-    } else if (error.message.includes('waitForSelector')) {
-      errorCategory = 'selector_timeout';
-    }
+    logger.error(`Job ${currentJobId} failed: ${error.message}`);
+
+    // Log failed activity
+    await logActivity(supabase, campaignId, 'connection_check', 'failed', 
+      { total: 0, successful: 0, failed: 0 },
+      error.message,
+      { startTime }
+    );
+
+    // Update job status to failed
     await withTimeout(
       supabase
         .from('jobs')
         .update({
           status: 'failed',
           error: error.message,
-          error_category: errorCategory,
+          error_category: 'unknown',
           updated_at: new Date().toISOString(),
         })
         .eq('job_id', currentJobId),
       10000,
-      'Timeout while updating job status to failed'
+      'Timeout while updating job status'
     );
 
-    // Send failure notification to Telegram
+    // Send Telegram notification
+    await bot.sendMessage(
+      process.env.TELEGRAM_NOTIFICATION_CHAT_ID,
+      `❌ Connection request check failed for campaign ${campaignId}: ${error.message}`
+    );
+
+    // Send job completion report
     await sendJobStatusReport(
       currentJobId,
-      'check_connection_requests',
+      'check',
       'failed',
       {
-        campaignId: parseInt(jobData?.campaign_id),
-        error: error.message,
-        summary: `❌ Connection Check Failed:
-• Campaign: ${jobData?.campaign_id}
-• Profiles Processed: ${processedProfiles || 0}
-• Error: ${error.message}`
+        campaignId,
+        campaignName: campaignNameData?.name,
+        message: `❌ Connection checks failed for campaign ${campaignId}:\n${error.message}`,
+        totalChecked: totalProfiles || 0,
+        acceptedCount: profilesAccepted || 0,
+        movedToLeadsCount: profilesMovedToLeads || 0,
+        failedCount: failedChecks.length || 0,
+        error: error.message
       }
     );
   } finally {
-    if (connectionChecker) {
-      await connectionChecker.closeBrowser();
+    try {
+      if (connectionChecker) {
+        await connectionChecker.closeBrowser();
+      }
+      if (page) await page.close();
+      if (browser) await browser.close();
+    } catch (err) {
+      logger.error(`Failed to close browser or page: ${err.message}`);
     }
   }
 };
 
-// Factory function pattern
+/**
+ * Creates a controller function for checking connection requests
+ * @param {import('@supabase/supabase-js').SupabaseClient} supabase - Supabase client instance
+ * @returns {Function} Express route handler
+ */
 module.exports = (supabase) => {
+  /**
+   * Express route handler for checking connection requests
+   * @param {import('express').Request} req - Express request object
+   * @param {import('express').Response} res - Express response object
+   * @returns {Promise<void>}
+   */
   return async (req, res) => {
-    const logger = createLogger();
-
     let jobId = null;
 
     try {
+      // Validate request body
       if (!req.body || typeof req.body !== 'object') {
-        logger.warn('Request body is missing or invalid');
         return res.status(400).json({
           success: false,
-          error: 'Request body is missing or invalid',
+          error: 'Request body is missing or invalid'
         });
       }
 
-      const {
-        campaignId,
-        maxProfiles = 20,
-        batchSize = 5,
+      const { 
+        campaignId, 
+        batchSize = 5, 
+        maxProfiles = 50 
       } = req.body;
 
       if (!campaignId) {
-        logger.warn('Missing required field: campaignId');
         return res.status(400).json({
           success: false,
-          error: 'Missing required field: campaignId',
+          error: 'campaignId is required'
         });
       }
 
-      if (!Number.isInteger(maxProfiles) || maxProfiles < 1) {
-        logger.warn('Invalid maxProfiles: must be a positive integer');
-        return res.status(400).json({
-          success: false,
-          error: 'Invalid maxProfiles: must be a positive integer',
-        });
-      }
-
-      if (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > maxProfiles) {
-        logger.warn('Invalid batchSize: must be a positive integer less than or equal to maxProfiles');
-        return res.status(400).json({
-          success: false,
-          error: 'Invalid batchSize: must be a positive integer less than or equal to maxProfiles',
-        });
-      }
-
-      logger.info(`Received request to check connection requests for campaignId: ${campaignId}`);
-
-      // Create a job
+      // Create a job record
       const { data: jobData, error: jobError } = await withTimeout(
         supabase
           .from('jobs')
           .insert({
             type: 'check_connection_requests',
             status: 'queued',
-            progress: 0,
-            error: null,
-            result: null,
-            campaign_id: campaignId.toString(),
-            max_profiles: maxProfiles,
+            campaign_id: campaignId,
             batch_size: batchSize,
+            max_profiles: maxProfiles,
             created_at: new Date().toISOString(),
             updated_at: new Date().toISOString(),
           })
-          .select('job_id')
+          .select()
           .single(),
         10000,
-        'Timeout while creating job in database'
+        'Timeout while creating job record'
       );
 
-      if (jobError || !jobData) {
-        logger.error(`Failed to create job: ${jobError?.message}`);
-        return res.status(500).json({ success: false, error: 'Failed to create job' });
+      if (jobError) {
+        logger.error(`Failed to create job record: ${jobError.message}`);
+        return res.status(500).json({
+          success: false,
+          error: `Failed to create job record: ${jobError.message}`
+        });
       }
 
       jobId = jobData.job_id;
-      logger.info(`Created job with ID: ${jobId} with status: queued`);
+      logger.info(`Created job with ID: ${jobId}`);
 
-      // Send immediate response
-      res.json({ success: true, jobId });
+      // Return success response with job ID
+      res.status(200).json({
+        success: true,
+        jobId
+      });
 
-      // Add job to queue
-      jobQueueManager.addJob(
-        () => processJob(jobId, supabase),
-        { jobId, type: 'check_connection_requests', campaignId }
-      ).catch(err => {
+      // Queue the job for processing
+      jobQueueManager.addJob(() => processJob(jobId, supabase), {
+        jobId,
+        type: 'check_connection_requests',
+        campaignId
+      }).catch(err => {
         logger.error(`Queue processing failed for job ${jobId}: ${err.message}`);
       });
 
     } catch (error) {
-      logger.error(`Error in /check-connection-requests route: ${error.message}`);
+      logger.error(`Error in check-connection-requests route: ${error.message}`);
+      
+      // If we created a job but something else failed, update its status
       if (jobId) {
         await withTimeout(
           supabase
@@ -566,7 +644,11 @@ module.exports = (supabase) => {
           'Timeout while updating job status'
         );
       }
-      return res.status(500).json({ success: false, error: error.message });
+
+      return res.status(500).json({
+        success: false,
+        error: error.message
+      });
     }
   };
 };

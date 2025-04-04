@@ -5,6 +5,8 @@ const fetch = require('node-fetch');
 const createLogger = require('../utils/logger');
 const { withTimeout } = require('../utils/databaseUtils');
 const { bot } = require('../telegramBot');
+const ResistanceHandler = require('../utils/resistanceHandler');
+const { hasDelayPassed } = require('../utils/dateUtils');
 
 const logger = createLogger();
 
@@ -14,6 +16,9 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
+// Initialize resistance handler
+const resistanceHandler = new ResistanceHandler(supabase);
+
 // Validate Telegram configuration
 const TELEGRAM_NOTIFICATION_CHAT_ID = process.env.TELEGRAM_NOTIFICATION_CHAT_ID;
 if (!TELEGRAM_NOTIFICATION_CHAT_ID) {
@@ -21,24 +26,31 @@ if (!TELEGRAM_NOTIFICATION_CHAT_ID) {
   process.exit(1);
 }
 
-// Configuration constants
+/**
+ * Message stages configuration with fixed working day delays
+ * TODO: Future enhancement - Make delays configurable:
+ * - Per campaign basis
+ * - Via environment variables
+ * - Through database configuration
+ * This would allow for more flexible messaging strategies per campaign/client
+ */
 const MESSAGE_STAGES = {
   FIRST_MESSAGE: {
     stage: 1,
-    delay: 0,
-    maxPerDay: 20,
+    delay_days: 0,
+    maxPerDay: 100, // High safety limit for 1st-degree connections
     description: 'first message'
   },
   SECOND_MESSAGE: {
     stage: 2,
-    delay: 3 * 24 * 60 * 60 * 1000, // 3 days
-    maxPerDay: 15,
+    delay_days: 3, // 3 working days delay
+    maxPerDay: 100, // High safety limit for 1st-degree connections
     description: 'second message'
   },
   THIRD_MESSAGE: {
     stage: 3,
-    delay: 4 * 24 * 60 * 60 * 1000, // 4 days
-    maxPerDay: 10,
+    delay_days: 3, // 3 working days delay from second message
+    maxPerDay: 100, // High safety limit for 1st-degree connections
     description: 'third message'
   }
 };
@@ -47,17 +59,26 @@ const SCHEDULE_WINDOWS = {
   'Europe': [
     { start: 7, end: 8 },
     { start: 8, end: 9 },
-    { start: 9, end: 10 }
+    { start: 9, end: 10 },
+    { start: 10, end: 11 },
+    { start: 11, end: 12 },
+    { start: 12, end: 13 }
   ],
   'North America': [
     { start: 13, end: 14 },
     { start: 14, end: 15 },
-    { start: 15, end: 16 }
+    { start: 15, end: 16 },
+    { start: 16, end: 17 },
+    { start: 17, end: 18 },
+    { start: 18, end: 19 }
   ],
   'Asia': [
     { start: 0, end: 1 },
     { start: 2, end: 3 },
-    { start: 3, end: 4 }
+    { start: 3, end: 4 },
+    { start: 4, end: 5 },
+    { start: 5, end: 6 },
+    { start: 6, end: 7 }
   ]
 };
 
@@ -67,18 +88,51 @@ const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 // Lock variable to prevent overlapping runs
 let isProcessing = false;
 
-// Campaign cooldown tracking
-const campaignCooldowns = new Map();
-
 // Function to check if campaign is in cooldown
-const isInCooldown = (campaignId) => {
-  const cooldownUntil = campaignCooldowns.get(campaignId);
-  return cooldownUntil && cooldownUntil > Date.now();
+const isInCooldown = async (campaignId) => {
+  try {
+    const { data, error } = await supabase
+      .from('campaign_cooldowns')
+      .select('cooldown_until')
+      .eq('campaign_id', campaignId)
+      .order('cooldown_until', { ascending: false })
+      .limit(1);
+
+    if (error) {
+      logger.error(`Error checking cooldown: ${error.message}`);
+      return false;
+    }
+
+    if (!data || data.length === 0) {
+      return false;
+    }
+
+    return data[0].cooldown_until && new Date(data[0].cooldown_until) > new Date();
+  } catch (error) {
+    logger.error(`Failed to check cooldown: ${error.message}`);
+    return false;
+  }
 };
 
 // Function to set campaign cooldown
-const setCampaignCooldown = (campaignId) => {
-  campaignCooldowns.set(campaignId, Date.now() + (2 * 60 * 60 * 1000)); // 2 hour cooldown
+const setCampaignCooldown = async (campaignId) => {
+  const cooldownUntil = new Date(Date.now() + (2 * 60 * 60 * 1000)); // 2 hour cooldown
+
+  try {
+    const { error } = await supabase
+      .from('campaign_cooldowns')
+      .upsert({
+        campaign_id: campaignId,
+        cooldown_until: cooldownUntil.toISOString(),
+        updated_at: new Date().toISOString()
+      });
+
+    if (error) {
+      logger.error(`Error setting cooldown: ${error.message}`);
+    }
+  } catch (error) {
+    logger.error(`Failed to set cooldown: ${error.message}`);
+  }
 };
 
 // Function to check if current time is within window
@@ -94,17 +148,16 @@ const isWithinTimeWindow = (timezone) => {
 async function getDailyMessageCount(campaignId, stage) {
   const today = new Date().toISOString().split('T')[0];
   try {
-    const { data, error } = await supabase
+    const { count, error } = await supabase
       .from('campaign_activity_logs')
-      .select('successful_count')
+      .select('id', { count: 'exact', head: true })
       .eq('campaign_id', campaignId)
-      .eq('activity_type', 'message_send')
-      .eq('details->message_stage', stage)
-      .gte('created_at', today)
-      .sum('successful_count');
+      .eq('activity_type', 'message_sent')
+      .eq('details->>message_stage', stage)
+      .gte('created_at', today);
 
     if (error) throw error;
-    return data?.[0]?.sum || 0;
+    return count || 0;
   } catch (error) {
     logger.error(`Error getting daily message count: ${error.message}`);
     return 0;
@@ -118,7 +171,7 @@ async function logActivity(campaignId, stage, status, counts = {}, error = null,
       .from('campaign_activity_logs')
       .insert({
         campaign_id: campaignId,
-        activity_type: 'message_send',
+        activity_type: 'message_sent',
         status: status,
         total_processed: counts.total || 0,
         successful_count: counts.successful || 0,
@@ -141,7 +194,7 @@ async function logActivity(campaignId, stage, status, counts = {}, error = null,
 
 // Function to process messages for a specific stage
 async function processMessageStage(campaign, messageStage) {
-  if (isInCooldown(campaign.id)) {
+  if (await isInCooldown(campaign.id)) {
     logger.info(`Campaign ${campaign.id} is in cooldown period, skipping...`);
     return;
   }
@@ -166,16 +219,20 @@ async function processMessageStage(campaign, messageStage) {
       body: JSON.stringify({
         campaignId: campaign.id,
         messageStage: messageStage.stage,
-        batchSize: batchSize
+        batchSize: batchSize,
+        delayDays: messageStage.delay_days // Pass the delay_days to the controller
       })
     });
 
     const result = await response.json();
 
     if (!result.success) {
-      // If we detect LinkedIn resistance, set cooldown
-      if (result.error?.includes('LinkedIn')) {
-        setCampaignCooldown(campaign.id);
+      // Use resistance handler to detect and handle LinkedIn resistance
+      if (result.error) {
+        const resistanceResult = await resistanceHandler.handleResistance(campaign.id, result.error);
+        if (resistanceResult) {
+          logger.warn(`LinkedIn resistance detected (${resistanceResult.resistanceType}). Campaign ${campaign.id} in cooldown until ${resistanceResult.cooldownUntil}`);
+        }
       }
       throw new Error(result.error || 'Failed to send messages');
     }
@@ -190,16 +247,6 @@ async function processMessageStage(campaign, messageStage) {
       skippedResponded: result.skippedResponded || 0
     });
 
-    // Send Telegram notification
-    const message = `✅ Sent ${messageStage.description} for campaign ${campaign.id} (${campaign.name})\n` +
-                   `📊 Results:\n` +
-                   `- Messages sent: ${result.successfulMessages || 0}\n` +
-                   `- Failed: ${result.failedMessages || 0}\n` +
-                   `- Skipped (responded): ${result.skippedResponded || 0}\n` +
-                   `- Remaining daily limit: ${remainingDaily - (result.successfulMessages || 0)}`;
-    
-    await bot.sendMessage(TELEGRAM_NOTIFICATION_CHAT_ID, message);
-
     return result.successfulMessages || 0;
 
   } catch (error) {
@@ -209,11 +256,6 @@ async function processMessageStage(campaign, messageStage) {
       { total: 0, successful: 0, failed: 0 }, 
       error.message
     );
-
-    // Send error notification
-    const errorMessage = `⚠️ Failed to send ${messageStage.description} for campaign ${campaign.id} (${campaign.name})\n` +
-                        `Error: ${error.message}`;
-    await bot.sendMessage(TELEGRAM_NOTIFICATION_CHAT_ID, errorMessage);
 
     return 0;
   }
@@ -228,7 +270,7 @@ async function processMessaging() {
 
   isProcessing = true;
   try {
-    // Get all active campaigns
+    // Get all active campaigns with automation enabled
     const { data: campaigns, error } = await withTimeout(
       supabase
         .from('campaigns')
@@ -244,7 +286,7 @@ async function processMessaging() {
     }
 
     if (!campaigns || campaigns.length === 0) {
-      logger.info('No active campaigns found');
+      logger.info('No active campaigns found with automation enabled');
       return;
     }
 
@@ -257,21 +299,65 @@ async function processMessaging() {
 
       logger.info(`Processing messages for campaign ${campaign.id}`);
 
-      // Process each message stage
+      // Get leads with their last_contacted dates to determine which stages to process
+      const { data: leadStats, error: statsError } = await withTimeout(
+        supabase
+          .from('leads')
+          .select('message_stage, last_contacted')
+          .eq('client_id', campaign.client_id)
+          .eq('status', 'not_replied')
+          .eq('connection_level', '1st'),
+        10000,
+        'Timeout while fetching lead statistics'
+      );
+
+      if (statsError) {
+        logger.error(`Error fetching lead statistics for campaign ${campaign.id}: ${statsError.message}`);
+        continue;
+      }
+
+      // Determine which stages have eligible leads
+      const eligibleStages = new Set();
+      
+      // Stage 1 is always eligible if there are leads with no messages
+      if (leadStats.some(lead => lead.message_stage === null)) {
+        eligibleStages.add(1);
+      }
+
+      // Check other stages
+      for (const lead of leadStats) {
+        if (!lead.message_stage || !lead.last_contacted) continue;
+        
+        const nextStage = lead.message_stage + 1;
+        if (nextStage > 3) continue; // We only have 3 stages
+        
+        const stageConfig = Object.values(MESSAGE_STAGES).find(s => s.stage === nextStage);
+        if (!stageConfig) continue;
+        
+        if (hasDelayPassed(lead.last_contacted, stageConfig.delay_days)) {
+          eligibleStages.add(nextStage);
+        }
+      }
+
+      // Process only the eligible stages
       for (const stage of Object.values(MESSAGE_STAGES)) {
-        await processMessageStage(campaign, stage);
-        // Add delay between stages
-        await delay(5000);
+        if (eligibleStages.has(stage.stage)) {
+          logger.info(`Processing stage ${stage.stage} for campaign ${campaign.id} - eligible leads found`);
+          await processMessageStage(campaign, stage);
+          await delay(5000); // 5 second delay between stages
+        } else {
+          logger.info(`Skipping stage ${stage.stage} for campaign ${campaign.id} - no eligible leads`);
+        }
       }
       
-      // Add delay between campaigns
-      await delay(5000);
+      await delay(5000); // 5 second delay between campaigns
     }
 
   } catch (error) {
     logger.error(`Error in messaging scheduler: ${error.message}`);
+    // Only notify on critical scheduler-level errors
     await bot.sendMessage(TELEGRAM_NOTIFICATION_CHAT_ID, 
-      `⚠️ Error in messaging scheduler: ${error.message}`);
+      `⚠️ Critical error in messaging scheduler: ${error.message}\nScheduler may need attention.`);
   } finally {
     isProcessing = false;
   }

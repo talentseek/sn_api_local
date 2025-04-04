@@ -1,162 +1,12 @@
 openapi: 3.0.0
 info:
   title: LinkedIn Sales Navigator Automation API
-  description: API for automating LinkedIn Sales Navigator operations including profile scraping, connection management, and messaging.
+  description: API for automating LinkedIn Sales Navigator operations including connection management, messaging, and company data retrieval.
   version: 1.0.0
 servers:
   - url: http://localhost:3000
     description: Development server
 paths:
-  /api/scrape:
-    post:
-      summary: Scrape profiles from LinkedIn Sales Navigator search results
-      description: |
-        Extracts profile data from LinkedIn Sales Navigator search results and stores them in the database.
-        Jobs are processed sequentially with a 1-second buffer between jobs to prevent system overload.
-        The scraper uses optimized viewport and zoom settings for reliable data extraction.
-      tags:
-        - Profile Scraping
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required:
-                - campaignId
-                - searchUrl
-                - lastPage
-              properties:
-                campaignId:
-                  type: integer
-                  description: ID of the campaign to associate with scraped profiles
-                searchUrl:
-                  type: string
-                  description: LinkedIn Sales Navigator search URL
-                lastPage:
-                  type: integer
-                  description: Number of search result pages to scrape
-                batchSize:
-                  type: integer
-                  description: Number of profiles to process in each batch
-                  default: 10
-                delayBetweenBatches:
-                  type: integer
-                  description: Delay in milliseconds between batches
-                  default: 3000
-            example:
-              campaignId: 123
-              searchUrl: "https://www.linkedin.com/sales/search/people?query=(spellCorrectionEnabled:true,keywords:software%20engineer)"
-              lastPage: 5
-              batchSize: 10
-              delayBetweenBatches: 3000
-      responses:
-        '200':
-          description: Job started successfully
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  success:
-                    type: boolean
-                    example: true
-                  jobId:
-                    type: string
-                    example: "12345"
-                  message:
-                    type: string
-                    example: "Job queued successfully. Jobs are processed sequentially with a 1-second buffer between jobs."
-                  queueStatus:
-                    type: object
-                    properties:
-                      queueLength:
-                        type: integer
-                        description: Number of jobs waiting in queue
-                        example: 0
-                      isProcessing:
-                        type: boolean
-                        description: Whether a job is currently being processed
-                        example: false
-                      activeJob:
-                        type: object
-                        description: Details of the currently active job, if any
-                        properties:
-                          jobId:
-                            type: string
-                          type:
-                            type: string
-                          campaignId:
-                            type: integer
-        '400':
-          description: Bad request - missing or invalid parameters
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  success:
-                    type: boolean
-                    example: false
-                  error:
-                    type: string
-                    example: "Missing required field: campaignId"
-        '500':
-          description: Server error
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  success:
-                    type: boolean
-                    example: false
-                  error:
-                    type: string
-                    example: "Failed to create job"
-  
-  /api/scrape-premium-profiles:
-    post:
-      summary: Scrape detailed information from premium profiles
-      description: Extracts detailed information from premium profiles in Sales Navigator.
-      tags:
-        - Profile Scraping
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required:
-                - campaignId
-                - searchUrl
-              properties:
-                campaignId:
-                  type: integer
-                  description: ID of the campaign
-                searchUrl:
-                  type: string
-                  description: LinkedIn Sales Navigator search URL
-                maxPages:
-                  type: integer
-                  description: Maximum number of pages to scrape
-                  default: 5
-            example:
-              campaignId: 123
-              searchUrl: "https://www.linkedin.com/sales/search/people?query=..."
-              maxPages: 5
-      responses:
-        '200':
-          description: Job started successfully
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/JobResponse'
-        '400':
-          $ref: '#/components/responses/BadRequest'
-        '500':
-          $ref: '#/components/responses/ServerError'
-  
   /api/check-open-profiles:
     post:
       summary: Check which profiles allow open messaging
@@ -678,13 +528,11 @@ components:
             error: "Failed to create job"
 
 tags:
-  - name: Profile Scraping
-    description: Operations for scraping profile data from LinkedIn
   - name: Profile Management
-    description: Operations for managing profile data
+    description: Operations for managing profile data and company information
   - name: Connection Management
-    description: Operations for managing connection requests
+    description: Operations for managing connection requests and relationships
   - name: Messaging
-    description: Operations for sending messages to profiles
+    description: Operations for sending messages to profiles and connections
   - name: Authentication
     description: Operations related to LinkedIn authentication 
