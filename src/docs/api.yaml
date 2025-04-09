@@ -1,54 +1,12 @@
 openapi: 3.0.0
 info:
   title: LinkedIn Sales Navigator Automation API
-  description: API for automating LinkedIn Sales Navigator operations including connection management, messaging, and company data retrieval.
+  description: API for automating LinkedIn Sales Navigator operations including connection management and messaging.
   version: 1.0.0
 servers:
-  - url: http://localhost:3000
+  - url: http://localhost:8080
     description: Development server
 paths:
-  /api/check-open-profiles:
-    post:
-      summary: Check which profiles allow open messaging
-      description: Identifies which profiles allow open messaging without a connection.
-      tags:
-        - Profile Management
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required:
-                - campaignId
-              properties:
-                campaignId:
-                  type: integer
-                  description: ID of the campaign
-                maxProfiles:
-                  type: integer
-                  description: Maximum number of profiles to check
-                  default: 50
-                batchSize:
-                  type: integer
-                  description: Number of profiles to process in each batch
-                  default: 10
-            example:
-              campaignId: 123
-              maxProfiles: 50
-              batchSize: 10
-      responses:
-        '200':
-          description: Job started successfully
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/JobResponse'
-        '400':
-          $ref: '#/components/responses/BadRequest'
-        '500':
-          $ref: '#/components/responses/ServerError'
-  
   /api/check-cookies:
     post:
       summary: Verify LinkedIn cookies validity
@@ -98,9 +56,6 @@ paths:
       description: |
         Sends connection requests to LinkedIn profiles with personalized messages.
         The system processes profiles in batches with configurable delays to prevent rate limiting.
-        Each request can include a personalized message using profile data placeholders.
-        The system handles various scenarios including pending requests, already connected profiles, and failed attempts.
-        Job status and statistics are reported via Telegram notifications.
       tags:
         - Connection Management
       requestBody:
@@ -148,71 +103,12 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  success:
-                    type: boolean
-                    example: true
-                  message:
-                    type: string
-                    example: "Connection requests job accepted and queued"
-                  jobId:
-                    type: string
-                    example: "connect_1234567890"
+                $ref: '#/components/schemas/JobResponse'
         '400':
-          description: Bad request - missing or invalid parameters
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  success:
-                    type: boolean
-                    example: false
-                  error:
-                    type: string
-                    example: "campaignId is required"
+          $ref: '#/components/responses/BadRequest'
         '500':
-          description: Server error
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  success:
-                    type: boolean
-                    example: false
-                  error:
-                    type: string
-                    example: "Failed to fetch campaign data"
-      x-codeSamples:
-        - lang: curl
-          source: |
-            curl -X POST http://localhost:8080/api/send-connection-requests \
-            -H "Content-Type: application/json" \
-            -d '{
-              "campaignId": 123,
-              "maxProfiles": 20,
-              "batchSize": 5,
-              "delayBetweenBatches": 5000,
-              "delayBetweenProfiles": 5000,
-              "sendMessage": true
-            }'
-      x-statusCodes:
-        - code: 200
-          description: Job successfully created and queued
-        - code: 400
-          description: Invalid request parameters
-        - code: 500
-          description: Server error occurred
-      x-telegramNotifications:
-        - type: success
-          description: Job completion notification with statistics
-        - type: error
-          description: Job failure notification with error details
-        - type: status
-          description: Status update during processing
-  
+          $ref: '#/components/responses/ServerError'
+
   /api/send-open-profile-messages:
     post:
       summary: Send messages to open profiles
@@ -264,25 +160,11 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '500':
           $ref: '#/components/responses/ServerError'
-  
+
   /api/check-connection-requests:
     post:
       summary: Check connection request status
-      description: |
-        Checks the status of previously sent connection requests. Profiles are checked in priority order:
-        1. Profiles that have never been checked (last_checked is NULL)
-        2. Profiles that were checked longest ago (ordered by last_checked ascending)
-        
-        When a connection is accepted:
-        - Profile is moved to the leads table (or updated if exists)
-        - Profile status is updated to 'connected'
-        - Last checked timestamp is updated
-        
-        The system includes rate limiting:
-        - 1-2 second delay between profiles
-        - 5-10 second delay between batches
-        
-        Job status and results are reported via Telegram notifications.
+      description: Checks the status of previously sent connection requests.
       tags:
         - Connection Management
       requestBody:
@@ -320,58 +202,11 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '500':
           $ref: '#/components/responses/ServerError'
-      x-codeSamples:
-        - lang: curl
-          source: |
-            curl -X POST http://localhost:8080/api/check-connection-requests \
-            -H "Content-Type: application/json" \
-            -d '{
-              "campaignId": 16,
-              "maxProfiles": 20,
-              "batchSize": 5
-            }'
-      x-statusCodes:
-        - code: 200
-          description: Job successfully created and queued
-        - code: 400
-          description: Invalid request parameters
-        - code: 500
-          description: Server error occurred
-      x-telegramNotifications:
-        - type: success
-          description: |
-            Job completion notification with statistics:
-            - Total profiles checked
-            - Still pending
-            - Newly connected
-            - Moved to leads
-            - Failed checks (if any)
-        - type: error
-          description: Job failure notification with error details
-        - type: status
-          description: Status updates during processing
-  
+
   /api/send-connection-messages:
     post:
       summary: Send messages to 1st-degree connections
-      description: |
-        Sends follow-up messages to 1st-degree connections on LinkedIn. Supports multi-stage messaging sequences 
-        with configurable delays between stages. Messages are personalized using profile data and sent in batches 
-        with rate limiting to prevent detection.
-
-        Key features:
-        - Multi-stage message sequences with configurable delays
-        - Personalized messages using profile data
-        - Batch processing with rate limiting
-        - Status tracking and detailed reporting
-        - Telegram notifications for job status
-        - Error handling and recovery
-
-        The system enforces delays between message stages and only processes leads that:
-        - Are 1st-degree connections
-        - Haven't been contacted for the current stage
-        - Haven't replied to previous messages
-        - Have passed the required delay period for their stage
+      description: Sends follow-up messages to 1st-degree connections on LinkedIn.
       tags:
         - Messaging
       requestBody:
@@ -404,71 +239,84 @@ paths:
           content:
             application/json:
               schema:
+                $ref: '#/components/schemas/JobResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '500':
+          $ref: '#/components/responses/ServerError'
+
+  /api/trigger-scheduler:
+    post:
+      summary: Manually trigger a scheduler
+      description: Triggers a specific scheduler to run immediately.
+      tags:
+        - Scheduler
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - scheduler
+              properties:
+                scheduler:
+                  type: string
+                  description: Name of the scheduler to trigger
+                  enum:
+                    - check-cookies
+                    - check-connections
+                    - send-connections
+                    - send-messages
+            example:
+              scheduler: "check-connections"
+      responses:
+        '200':
+          description: Scheduler triggered successfully
+          content:
+            application/json:
+              schema:
                 type: object
                 properties:
                   success:
                     type: boolean
                     example: true
-                  jobId:
-                    type: string
-                    example: "msg_1234567890"
                   message:
                     type: string
-                    example: "Connection messages job accepted and queued"
+                    example: "Triggered check-connections scheduler"
         '400':
-          description: Bad request - missing or invalid parameters
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  success:
-                    type: boolean
-                    example: false
-                  error:
-                    type: string
-                    example: "Missing required field: campaignId"
+          $ref: '#/components/responses/BadRequest'
         '500':
-          description: Server error
+          $ref: '#/components/responses/ServerError'
+
+  /health:
+    get:
+      summary: Health check endpoint
+      description: Checks the health of the service including database connection and job queue status.
+      tags:
+        - System
+      responses:
+        '200':
+          description: Service is healthy
           content:
             application/json:
               schema:
                 type: object
                 properties:
-                  success:
-                    type: boolean
-                    example: false
-                  error:
+                  status:
                     type: string
-                    example: "Failed to fetch campaign data"
-      x-codeSamples:
-        - lang: curl
-          source: |
-            curl -X POST http://localhost:8080/api/send-connection-messages \
-            -H "Content-Type: application/json" \
-            -d '{
-              "campaignId": 31,
-              "messageStage": 1,
-              "batchSize": 5
-            }'
-      x-statusCodes:
-        - code: 200
-          description: Job successfully created and queued
-        - code: 400
-          description: Invalid request parameters
-        - code: 500
-          description: Server error occurred
-      x-telegramNotifications:
-        - type: success
-          description: |
-            Job completion notification with statistics:
-            - Total leads processed
-            - Messages sent
-            - Failed messages (with details if any)
-        - type: error
-          description: Job failure notification with error details
-        - type: status
-          description: Status updates during processing
+                    example: "healthy"
+                  database:
+                    type: string
+                    example: "connected"
+                  jobQueue:
+                    type: object
+                    description: Status of the job queue
+                  timestamp:
+                    type: string
+                    format: date-time
+        '500':
+          $ref: '#/components/responses/ServerError'
 
 components:
   schemas:
@@ -483,7 +331,7 @@ components:
           example: "12345"
         message:
           type: string
-          example: "Job queued successfully. Jobs are processed sequentially."
+          example: "Job queued successfully"
     
     ErrorResponse:
       type: object
@@ -494,17 +342,6 @@ components:
         error:
           type: string
           example: "Error message"
-    
-    JobStatus:
-      type: string
-      description: Status of a job in the system
-      enum:
-        - queued
-        - started
-        - in_progress
-        - completed
-        - failed
-      example: "in_progress"
   
   responses:
     BadRequest:
@@ -525,14 +362,16 @@ components:
             $ref: '#/components/schemas/ErrorResponse'
           example:
             success: false
-            error: "Failed to create job"
+            error: "Internal server error"
 
 tags:
-  - name: Profile Management
-    description: Operations for managing profile data and company information
+  - name: Authentication
+    description: Operations related to LinkedIn authentication
   - name: Connection Management
     description: Operations for managing connection requests and relationships
   - name: Messaging
     description: Operations for sending messages to profiles and connections
-  - name: Authentication
-    description: Operations related to LinkedIn authentication 
+  - name: Scheduler
+    description: Operations for manually triggering schedulers
+  - name: System
+    description: System health and monitoring operations 

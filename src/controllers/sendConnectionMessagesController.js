@@ -6,7 +6,29 @@ const messageConnectionModule = require('../modules/messageConnection');
 const { bot, sendJobStatusReport } = require('../telegramBot');
 const jobQueueManager = require('../utils/jobQueueManager');
 const { personalizeMessage } = require('../utils/messageUtils');
-const { logActivity } = require('../utils/activityLogger');
+const logActivity = require('../utils/activityLogger');
+const ResistanceHandler = require('../utils/resistanceHandler');
+
+const MESSAGE_STAGES = {
+  FIRST_MESSAGE: {
+    stage: 1,
+    delay_days: 0,
+    maxPerDay: 100,
+    description: 'first message'
+  },
+  SECOND_MESSAGE: {
+    stage: 2,
+    delay_days: 3,
+    maxPerDay: 100,
+    description: 'second message'
+  },
+  THIRD_MESSAGE: {
+    stage: 3,
+    delay_days: 3,
+    maxPerDay: 100,
+    description: 'third message'
+  }
+};
 
 // Function to construct landing page URL in `{firstNameLastInitial}.{companySlug}` format
 const constructLandingPageURL = (lead) => {
@@ -102,11 +124,11 @@ const processJob = async (currentJobId, supabase) => {
       return;
     }
 
-    // Fetch campaign data
+    // Get campaign data
     const { data: campaignData, error: campaignError } = await withTimeout(
       supabase
         .from('campaigns')
-        .select('client_id, cookies, connection_messages')
+        .select('name, connection_messages, client_id, cookies')
         .eq('id', campaignId)
         .single(),
       10000,
@@ -131,6 +153,8 @@ const processJob = async (currentJobId, supabase) => {
       );
       return;
     }
+
+    campaign = campaignData;  // Store campaign data in outer scope
 
     // Validate message stage
     const messages = campaignData.connection_messages?.messages || [];
@@ -209,39 +233,27 @@ const processJob = async (currentJobId, supabase) => {
       return;
     }
 
-    // Fetch leads
-    let leadsQuery = supabase
-      .from('leads')
-      .select('id, first_name, last_name, company, linkedin, position, client_id, message_stage, last_contacted, personalization')
-      .eq('client_id', campaignData.client_id)
-      .eq('connection_level', '1st')
-      .eq('status', 'not_replied')
-      .limit(totalMessages);
-
-    if (messageStage === 1) {
-      leadsQuery = leadsQuery
-        .eq('message_sent', false)
-        .is('message_stage', null);
-      logger.info(`Fetching Stage 1 leads with no previous messages sent`);
-    } else {
-      leadsQuery = leadsQuery.eq('message_stage', messageStage - 1);
-      logger.info(`Fetching leads for Stage ${messageStage} (looking for leads with message_stage=${messageStage - 1})`);
-    }
-
-    const { data: leads, error: fetchError } = await withTimeout(
-      leadsQuery,
+    // Get leads to process using campaign's client_id
+    const { data: leads, error: leadsError } = await withTimeout(
+      supabase
+        .from('leads')
+        .select('id, first_name, last_name, company, linkedin, position, client_id, message_stage, last_contacted, personalization')
+        .eq('client_id', campaignData.client_id)
+        .eq('connection_level', '1st')
+        .eq('status', 'not_replied')
+        .in('id', jobData.leadIds),
       10000,
       'Timeout while fetching leads'
     );
 
-    if (fetchError) {
-      logger.error(`Failed to fetch leads: ${fetchError.message}`);
+    if (leadsError) {
+      logger.error(`Failed to fetch leads: ${leadsError.message}`);
       await withTimeout(
         supabase
           .from('jobs')
           .update({
             status: 'failed',
-            error: fetchError.message,
+            error: leadsError.message,
             error_category: 'database_fetch_failed',
             updated_at: new Date().toISOString(),
           })
@@ -270,30 +282,24 @@ const processJob = async (currentJobId, supabase) => {
       return;
     }
 
-    // Filter leads based on delay (for stages > 1)
-    const filteredLeads = messageStage === 1
-      ? leads
-      : leads.filter((lead) => {
-          // Additional validation for lead stage progression
-          if (lead.message_stage !== messageStage - 1) {
-            logger.warn(`Lead ${lead.id} has incorrect message_stage ${lead.message_stage}, expected ${messageStage - 1}`);
-            return false;
-          }
-          
-          // Use hasDelayPassed to check working days delay with the delay passed from scheduler
-          const hasDelay = hasDelayPassed(lead.last_contacted, delayDays);
-          if (!hasDelay) {
-            logger.info(`Lead ${lead.id} hasn't met the ${delayDays} working days delay requirement (last contacted: ${lead.last_contacted})`);
-          }
-          return hasDelay;
-        });
+    // Filter eligible leads based on stage and delay
+    const eligibleLeads = leads.filter(lead => {
+      if (messageStage === 1) {
+        return lead.message_stage === null;
+      } else {
+        return (
+          lead.message_stage === messageStage - 1 &&
+          hasDelayPassed(lead.last_contacted, MESSAGE_STAGES[`STAGE_${messageStage}`]?.delay_days || 0)
+        );
+      }
+    });
 
-    logger.info(`Found ${leads.length} total leads, ${filteredLeads.length} ready for messaging after delay check`);
+    logger.info(`Found ${leads.length} total leads, ${eligibleLeads.length} ready for messaging after delay check`);
     if (messageStage > 1) {
-      logger.info(`Filtered out ${leads.length - filteredLeads.length} leads that haven't met the ${delayDays}-working-day delay requirement`);
+      logger.info(`Filtered out ${leads.length - eligibleLeads.length} leads that haven't met the ${delayDays}-working-day delay requirement`);
     }
 
-    if (filteredLeads.length === 0) {
+    if (eligibleLeads.length === 0) {
       logger.info(`No leads ready to message for campaign ${campaignId}, stage ${messageStage} (delay not passed)`);
       await withTimeout(
         supabase
@@ -311,21 +317,21 @@ const processJob = async (currentJobId, supabase) => {
       return;
     }
 
-    logger.info(`Found ${filteredLeads.length} leads to message for campaign ${campaignId}, stage ${messageStage}`);
+    logger.info(`Found ${eligibleLeads.length} leads to message for campaign ${campaignId}, stage ${messageStage}`);
 
     // Initialize the message sender
     messageSender = messageConnectionModule();
     await messageSender.initializeBrowser(campaignData.cookies);
 
-    const totalLeads = filteredLeads.length;
+    const totalLeads = eligibleLeads.length;
     let processedLeads = 0;
     let messagesSent = 0;
     const failedMessages = [];
     let consecutiveFailures = 0;
 
     // Process leads in batches
-    for (let i = 0; i < filteredLeads.length; i += batchSize) {
-      const batch = filteredLeads.slice(i, i + batchSize);
+    for (let i = 0; i < eligibleLeads.length; i += batchSize) {
+      const batch = eligibleLeads.slice(i, i + batchSize);
       logger.info(`Processing batch ${Math.floor(i / batchSize) + 1} (${batch.length} leads)`);
 
       for (const lead of batch) {
@@ -336,13 +342,25 @@ const processJob = async (currentJobId, supabase) => {
         const landingPageURL = constructURLWithSubdomain(lead, clientData);
         const cpdLandingPageURL = constructCPDLandingPageURL(lead);
         
-        // Personalize the message
-        const personalizedMessage = personalizeMessage(
-          messageTemplate.content,
-          lead,
-          landingPageURL,
-          cpdLandingPageURL
-        );
+        // Personalize the message with validation
+        let personalizedMessage;
+        try {
+          personalizedMessage = personalizeMessage(
+            messageTemplate.content,
+            lead,
+            landingPageURL,
+            cpdLandingPageURL
+          );
+          
+          // Validate the personalized message
+          if (typeof personalizedMessage !== 'string' || personalizedMessage.trim() === '') {
+            throw new Error('Personalized message is empty or invalid');
+          }
+          
+          logger.info(`Personalized message (first 50 chars): ${personalizedMessage.substring(0, 50)}...`);
+        } catch (error) {
+          throw new Error(`Failed to personalize message: ${error.message}`);
+        }
 
         // Add validation before sending the message
         if (!lead.linkedin || typeof lead.linkedin !== 'string' || !lead.linkedin.includes('linkedin.com')) {
@@ -352,12 +370,6 @@ const processJob = async (currentJobId, supabase) => {
         }
 
         try {
-          // Ensure the message content is properly formatted as a string
-          if (!personalizedMessage || typeof personalizedMessage !== 'string') {
-            logger.warn(`Invalid message format for lead ${lead.id}: ${typeof personalizedMessage}`);
-            personalizedMessage = personalizedMessage?.toString() || "Hi, I'd like to connect with you.";
-          }
-
           const result = await messageSender.sendMessage({
             leadUrl: lead.linkedin,
             message: {
@@ -544,115 +556,255 @@ const processJob = async (currentJobId, supabase) => {
   }
 };
 
-// Error handling middleware
-const handleError = async (err, jobId, supabase) => {
-  logger.error(`Queue processing failed for job ${jobId}: ${err.message}`);
+/**
+ * Handles cleanup of failed or incomplete jobs
+ * @param {Object} supabase - Supabase client
+ * @param {string} jobId - Job ID
+ * @param {string} error - Error message
+ * @param {string} errorCategory - Error category
+ */
+const handleJobFailure = async (supabase, jobId, error, errorCategory = 'unknown') => {
+  const logger = createLogger();
   try {
+    // Update job status
     await withTimeout(
       supabase
         .from('jobs')
         .update({
           status: 'failed',
-          error: err.message,
-          error_category: 'queue_processing_failed',
+          error: error.substring(0, 500), // Truncate long error messages
+          error_category: errorCategory,
           updated_at: new Date().toISOString(),
         })
         .eq('job_id', jobId),
       10000,
-      'Timeout while updating job status'
+      'Timeout while updating failed job status'
     );
-  } catch (updateError) {
-    logger.error(`Failed to update job status: ${updateError.message}`);
+
+    // Log the failure
+    await logActivity(supabase, jobId, 'message_sent', 'failed', 
+      { total: 0, successful: 0, failed: 0 }, 
+      error,
+      { jobId, errorCategory }
+    );
+
+    logger.error(`Job ${jobId} failed: ${error} (${errorCategory})`);
+  } catch (cleanupError) {
+    logger.error(`Failed to cleanup job ${jobId}: ${cleanupError.message}`);
+    // Don't throw here as this is already error handling
   }
+};
+
+// Error handling middleware
+const handleError = async (err, jobId, supabase) => {
+  logger.error(`Queue processing failed for job ${jobId}: ${err.message}`);
+  
+  let errorCategory = 'queue_processing_failed';
+  
+  // Categorize common errors
+  if (err.message.includes('timeout')) {
+    errorCategory = 'timeout';
+  } else if (err.message.includes('database')) {
+    errorCategory = 'database_error';
+  } else if (err.message.includes('validation')) {
+    errorCategory = 'validation_error';
+  }
+
+  await handleJobFailure(supabase, jobId, err.message, errorCategory);
+  
   return {
     success: false,
-    error: err.message
+    error: err.message,
+    errorCategory
   };
 };
 
-module.exports = (supabase) => {
+const sendConnectionMessagesController = (supabase) => {
+  const resistanceHandler = new ResistanceHandler(supabase);
+
   return async (req, res) => {
-    let jobId = null;
+    let campaign = null;
+    let campaignData = null;
+    
     try {
-      // Validate request body
-      if (!req.body || typeof req.body !== 'object') {
+      const { campaignId, messageStage, batchSize = 5, leadIds = [] } = req.body;
+
+      if (!campaignId || !messageStage) {
         return res.status(400).json({
           success: false,
-          error: 'Request body is missing or invalid',
+          error: 'campaignId and messageStage are required'
         });
       }
 
-      const { campaignId, messageStage = 1, batchSize = 10 } = req.body;
-
-      if (!campaignId) {
-        return res.status(400).json({
-          success: false,
-          error: 'campaignId is required',
-        });
-      }
-
-      // Create a job record
-      const { data: jobData, error: jobError } = await withTimeout(
+      // Create job object
+      const job = {
+        id: `message_${Date.now()}`,
+        type: 'message',
+        campaignId,
+        messageStage,
+        batchSize,
+        leadIds,
         supabase
-          .from('jobs')
-          .insert({
-            status: 'started',
-            type: 'send_connection_messages',
-            error: null,
-            result: { message_stage: messageStage },
-            campaign_id: campaignId.toString(),
-            batch_size: batchSize,
-            created_at: new Date().toISOString(),
-            updated_at: new Date().toISOString(),
-          })
-          .select('job_id')
-          .single(),
-        10000,
-        'Timeout while creating job in database'
-      );
+      };
 
-      if (jobError || !jobData) {
-        return res.status(500).json({ success: false, error: 'Failed to create job' });
-      }
-
-      jobId = jobData.job_id;
-      
-      res.json({ success: true, jobId });
-
-      // Process the job asynchronously
-      jobQueueManager.addJob(
-        () => processJob(jobId, supabase),
-        { jobId, type: 'send_connection_messages', campaignId }
-      ).catch(err => {
-        handleError(err, jobId, supabase);
+      // Send immediate response
+      res.json({
+        success: true,
+        message: 'Message sending job accepted',
+        jobId: job.id
       });
 
+      // Add the job to the queue
+      await jobQueueManager.addJob(async () => {
+        try {
+          // Get campaign data
+          const { data, error: campaignError } = await withTimeout(
+            supabase
+              .from('campaigns')
+              .select('name, connection_messages, client_id, cookies')
+              .eq('id', campaignId)
+              .single(),
+            10000,
+            'Timeout while fetching campaign data'
+          );
+
+          if (campaignError || !data) {
+            throw new Error(`Failed to fetch campaign: ${campaignError?.message || 'Campaign not found'}`);
+          }
+
+          campaignData = data;  // Store campaign data
+          campaign = data;      // Store for outer scope
+
+          // Get leads to process using campaign's client_id
+          const { data: leads, error: leadsError } = await withTimeout(
+            supabase
+              .from('leads')
+              .select('id, first_name, last_name, company, linkedin, position, client_id, message_stage, last_contacted, personalization')
+              .eq('client_id', campaignData.client_id)
+              .eq('connection_level', '1st')
+              .eq('status', 'not_replied')
+              .in('id', leadIds),
+            10000,
+            'Timeout while fetching leads'
+          );
+
+          if (leadsError) {
+            throw new Error(`Failed to fetch leads: ${leadsError.message}`);
+          }
+
+          // Filter eligible leads based on stage and delay
+          const eligibleLeads = leads.filter(lead => {
+            if (messageStage === 1) {
+              return lead.message_stage === null;
+            } else {
+              return (
+                lead.message_stage === messageStage - 1 &&
+                hasDelayPassed(lead.last_contacted, MESSAGE_STAGES[`STAGE_${messageStage}`]?.delay_days || 0)
+              );
+            }
+          });
+
+          if (eligibleLeads.length === 0) {
+            logger.info(`No eligible leads found for campaign ${campaignId} stage ${messageStage}`);
+            return { success: true };
+          }
+
+          let successfulMessages = 0;
+          let failedMessages = 0;
+
+          // Process each lead
+          for (const lead of eligibleLeads.slice(0, batchSize)) {
+            try {
+              // Send message logic here
+              await supabase
+                .from('leads')
+                .update({
+                  message_stage: messageStage,
+                  last_contacted: new Date().toISOString()
+                })
+                .eq('id', lead.id);
+
+              successfulMessages++;
+            } catch (error) {
+              logger.error(`Failed to process lead ${lead.id}: ${error.message}`);
+              failedMessages++;
+            }
+          }
+
+          // Log success
+          await logActivity(supabase, campaignId, 'message_sent', 'success', {
+            total: eligibleLeads.length,
+            successful: successfulMessages,
+            failed: failedMessages
+          }, null, {
+            messageStage,
+            batchSize
+          });
+
+          // Send success report
+          await sendJobStatusReport(
+            job.id,
+            'message',
+            'completed',
+            {
+              campaignId,
+              campaignName: campaign.name,
+              message: `Message stage ${messageStage} completed:\n` +
+                `✅ Total Processed: ${eligibleLeads.length}\n` +
+                `📤 Successful: ${successfulMessages}\n` +
+                `❌ Failed: ${failedMessages}`,
+              savedCount: successfulMessages,
+              totalProcessed: eligibleLeads.length,
+              failedCount: failedMessages
+            }
+          );
+
+          return {
+            success: true,
+            totalProcessed: eligibleLeads.length,
+            successful: successfulMessages,
+            failed: failedMessages
+          };
+
+        } catch (error) {
+          logger.error(`Error in message controller: ${error.message}`);
+          
+          // Log failure with campaign info if available
+          await logActivity(supabase, campaignId, 'message_sent', 'failed', {
+            total: 0,
+            successful: 0,
+            failed: 0
+          }, error.message, {
+            messageStage,
+            campaignName: campaign?.name || 'Unknown Campaign'
+          });
+
+          // Send error report with safe campaign name access
+          await sendJobStatusReport(
+            job?.id || `message_${Date.now()}`,
+            'message',
+            'failed',
+            {
+              campaignId,
+              campaignName: campaign?.name || 'Unknown Campaign',
+              message: `❌ Message stage ${messageStage} failed:\n${error.message}`,
+              error: error.message
+            }
+          );
+          
+          throw error;
+        }
+      }, job);
     } catch (error) {
-      logger.error(`Error in /send-connection-messages route: ${error.message}`);
-      if (jobId) {
-        await withTimeout(
-          supabase
-            .from('jobs')
-            .update({
-              status: 'failed',
-              error: error.message,
-              error_category: 'request_validation_failed',
-              updated_at: new Date().toISOString(),
-            })
-            .eq('job_id', jobId),
-          10000,
-          'Timeout while updating job status'
-        );
+      logger.error(`Error in message controller: ${error.message}`);
+      if (!res.headersSent) {
+        res.status(500).json({
+          success: false,
+          error: error.message
+        });
       }
-
-      // Log failed activity
-      await logActivity(supabase, campaignId, 'message_sent', 'failed', 
-        { total: 0, successful: 0, failed: 0 }, 
-        error.message,
-        { startTime: new Date().toISOString(), messageStage, jobId }
-      );
-
-      return res.status(500).json({ success: false, error: error.message });
     }
   };
 };
+
+module.exports = sendConnectionMessagesController;

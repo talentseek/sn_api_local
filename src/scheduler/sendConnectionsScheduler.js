@@ -4,8 +4,9 @@ const { createClient } = require('@supabase/supabase-js');
 const fetch = require('node-fetch');
 const createLogger = require('../utils/logger');
 const { withTimeout } = require('../utils/databaseUtils');
-const { bot } = require('../telegramBot');
-const { logActivity } = require('../utils/activityLogger');
+const { bot, sendJobStatusReport } = require('../telegramBot');
+const logActivity = require('../utils/activityLogger');
+const ResistanceHandler = require('../utils/resistanceHandler');
 
 const logger = createLogger();
 
@@ -62,12 +63,16 @@ const isWithinTimeWindow = (timezone) => {
 
 // Function to update daily connection count
 async function updateDailyConnectionCount(campaignId, connectionsToAdd) {
-  if (!connectionsToAdd || typeof connectionsToAdd !== 'number') {
-    logger.warn(`Invalid connectionsToAdd value for campaign ${campaignId}: ${connectionsToAdd}`);
-    connectionsToAdd = 0;
+  if (typeof campaignId !== 'number' && typeof campaignId !== 'string') {
+    throw new Error(`Invalid campaign ID: ${campaignId}`);
   }
 
+  // Ensure connectionsToAdd is a non-negative number
+  connectionsToAdd = Math.max(0, parseInt(connectionsToAdd) || 0);
+  logger.info(`Updating daily connection count for campaign ${campaignId}: adding ${connectionsToAdd}`);
+
   const today = new Date().toISOString().split('T')[0];
+  const timestamp = new Date().toISOString();
   
   try {
     // First try to update existing record
@@ -84,24 +89,33 @@ async function updateDailyConnectionCount(campaignId, connectionsToAdd) {
 
     if (existing) {
       // Update existing record, ensure we're not adding to null
-      const currentCount = existing.connections_sent || 0;
+      const currentCount = Math.max(0, parseInt(existing.connections_sent) || 0);
+      const newCount = currentCount + connectionsToAdd;
+      
+      logger.info(`Updating existing record: ${currentCount} + ${connectionsToAdd} = ${newCount}`);
+
       const { error: updateError } = await supabase
         .from('daily_connection_tracking')
-        .update({ connections_sent: currentCount + connectionsToAdd })
+        .update({ 
+          connections_sent: newCount,
+          updated_at: timestamp
+        })
         .eq('campaign_id', campaignId)
         .eq('date', today);
 
       if (updateError) throw updateError;
     } else {
-      // Insert new record, initialize with connectionsToAdd
+      // Insert new record
+      logger.info(`Creating new record with ${connectionsToAdd} connections`);
+
       const { error: insertError } = await supabase
         .from('daily_connection_tracking')
         .insert({
           campaign_id: campaignId,
           date: today,
           connections_sent: connectionsToAdd,
-          created_at: new Date().toISOString(),
-          updated_at: new Date().toISOString()
+          created_at: timestamp,
+          updated_at: timestamp
         });
 
       if (insertError) throw insertError;
@@ -120,15 +134,22 @@ async function updateDailyConnectionCount(campaignId, connectionsToAdd) {
     }
 
     if (verification.connections_sent === null) {
-      logger.error(`Connections sent is still null for campaign ${campaignId} after update`);
-      // Fix the null value
-      await supabase
+      logger.warn(`Fixing null connections_sent value for campaign ${campaignId}`);
+      const { error: fixError } = await supabase
         .from('daily_connection_tracking')
-        .update({ connections_sent: connectionsToAdd })
+        .update({ 
+          connections_sent: connectionsToAdd,
+          updated_at: timestamp
+        })
         .eq('campaign_id', campaignId)
         .eq('date', today);
+
+      if (fixError) {
+        throw new Error(`Failed to fix null value: ${fixError.message}`);
+      }
     }
 
+    logger.info(`Successfully updated daily connection count for campaign ${campaignId}`);
   } catch (error) {
     logger.error(`Failed to update daily connection count for campaign ${campaignId}: ${error.message}`);
     throw error;
@@ -188,9 +209,17 @@ function calculateOptimalBatchSize(remainingLimit, timeWindow, currentHour) {
 // Function to process connection requests for a campaign
 async function processConnectionRequests(campaign) {
   const startTime = new Date().toISOString();
-  const logger = createLogger();
+  const jobId = `connect_${Date.now()}`;
+  const resistanceHandler = new ResistanceHandler(supabase);
   
   try {
+    // Log activity start
+    await logActivity(supabase, campaign.id, 'connection_request', 'running', 
+      { total: 0, successful: 0, failed: 0 }, 
+      null,
+      { startTime }
+    );
+
     // Check if campaign is in cooldown
     const { data: cooldown } = await supabase
       .from('campaign_cooldowns')
@@ -251,56 +280,87 @@ async function processConnectionRequests(campaign) {
       throw new Error(result.error || 'Failed to send connection requests');
     }
 
+    // Validate result counts
+    const sentCount = result.sentCount || 0;
+    const totalProcessed = result.totalProcessed || 0;
+    const failedCount = result.failedCount || 0;
+
+    logger.info(`Connection request results - Sent: ${sentCount}, Total: ${totalProcessed}, Failed: ${failedCount}`);
+
     // Update tracking and campaign status
-    await Promise.all([
-      // Update daily tracking
-      updateDailyConnectionCount(campaign.id, result.sentCount),
+    try {
+      // First update daily tracking
+      await updateDailyConnectionCount(campaign.id, sentCount);
+
+      // Then update campaign status
+      const { data: currentCampaign } = await supabase
+        .from('campaigns')
+        .select('total_connections_sent, name')
+        .eq('id', campaign.id)
+        .single();
       
-      // Update campaign status - First get current total
-      (async () => {
-        const { data: currentCampaign } = await supabase
-          .from('campaigns')
-          .select('total_connections_sent')
-          .eq('id', campaign.id)
-          .single();
-        
-        const newTotal = (currentCampaign?.total_connections_sent || 0) + result.sentCount;
-        
-        await supabase
-          .from('campaigns')
-          .update({
-            last_connection_request_at: new Date().toISOString(),
-            total_connections_sent: newTotal
-          })
-          .eq('id', campaign.id);
-      })(),
+      const currentTotal = currentCampaign?.total_connections_sent || 0;
+      const newTotal = currentTotal + sentCount;
       
-      // Log activity
-      logActivity(campaign.id, 'connection_request', 'success', {
-        total: result.totalProcessed,
-        successful: result.sentCount,
-        failed: result.failedCount
+      await supabase
+        .from('campaigns')
+        .update({
+          last_connection_request_at: new Date().toISOString(),
+          total_connections_sent: newTotal
+        })
+        .eq('id', campaign.id);
+
+      // Finally log success activity
+      await logActivity(supabase, campaign.id, 'connection_request', 'success', {
+        total: totalProcessed,
+        successful: sentCount,
+        failed: failedCount
       }, null, {
         batchMetrics: {
           optimalBatchSize,
           remainingLimit,
           sentToday
-        }
-      })
-    ]);
+        },
+        startTime,
+        campaignName: currentCampaign?.name || 'Unknown Campaign'
+      });
 
-    logger.success(`Successfully processed ${result.sentCount} connection requests for campaign ${campaign.id}`);
+      logger.success(`Successfully processed ${sentCount} connection requests for campaign ${campaign.id}`);
+    } catch (updateError) {
+      logger.error(`Error updating campaign data: ${updateError.message}`);
+      throw updateError;
+    }
 
   } catch (error) {
     logger.error(`Error processing campaign ${campaign.id}: ${error.message}`);
     
     // Log failure activity
-    await logActivity(campaign.id, 'connection_request', 'failed', {
+    await logActivity(supabase, campaign.id, 'connection_request', 'failed', {
       total: 0,
       successful: 0,
       failed: 0
-    }, error.message);
+    }, error.message, { startTime });
     
+    // Check for resistance in any uncaught errors
+    await resistanceHandler.handleResistance(campaign.id, error.message);
+    logger.error(`Error processing connection requests job ${jobId}: ${error.message}`);
+    
+    // Send error notification
+    await sendJobStatusReport(
+      jobId,
+      'connect',
+      'failed',
+      {
+        campaignId: campaign.id,
+        campaignName: campaign.name || 'Unknown Campaign',
+        message: `❌ Connection requests failed for campaign ${campaign.id}:\n${error.message}`,
+        savedCount: 0,
+        totalScraped: 0,
+        totalValid: 0,
+        error: error.message
+      }
+    );
+
     throw error;
   }
 }

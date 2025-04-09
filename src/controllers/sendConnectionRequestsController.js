@@ -7,7 +7,7 @@ const puppeteer = require('puppeteer');
 const { bot, sendJobStatusReport } = require('../telegramBot');
 const { personalizeMessage } = require('../utils/messageUtils');
 const ResistanceHandler = require('../utils/resistanceHandler');
-const { logActivity } = require('../utils/activityLogger');
+const logActivity = require('../utils/activityLogger');
 
 const logger = createLogger();
 
@@ -109,22 +109,43 @@ const sendConnectionRequestsController = (supabase) => {
         });
       }
 
-      // Create a job function that will be executed by the queue
-      const jobFunction = async () => {
+      // Create job object with all necessary data
+      const job = {
+        id: `connect_${Date.now()}`,
+        type: 'connect',
+        campaignId,
+        maxProfiles,
+        batchSize,
+        delayBetweenBatches,
+        delayBetweenProfiles,
+        sendMessage,
+        maxRetries,
+        supabase
+      };
+
+      // Send immediate response
+      res.json({
+        success: true,
+        message: 'Connection requests job accepted',
+        jobId: job.id
+      });
+
+      // Add the job to the queue after sending response
+      await jobQueueManager.addJob(async () => {
         let browser = null;
         let page = null;
+        let campaignData = null;
         
-        // Initialize counters outside try block so they're accessible in catch
+        // Initialize counters
         let processedCount = 0;
         let sentCount = 0;
         let pendingCount = 0;
         let connectedCount = 0;
-        let followingCount = 0;
         let failedCount = 0;
         
         try {
-          // Fetch campaign data to get cookies and message template
-          const { data: campaignData, error: campaignError } = await withTimeout(
+          // Fetch campaign data first
+          const { data, error: campaignError } = await withTimeout(
             supabase
               .from('campaigns')
               .select('name, cookies, connection_messages')
@@ -134,9 +155,11 @@ const sendConnectionRequestsController = (supabase) => {
             'Timeout while fetching campaign data'
           );
 
-          if (campaignError || !campaignData?.cookies) {
+          if (campaignError || !data?.cookies) {
             throw new Error(`Failed to load campaign data: ${campaignError?.message || 'No cookies found'}`);
           }
+
+          campaignData = data;
 
           // Initialize browser
           browser = await puppeteer.launch({
@@ -218,11 +241,14 @@ const sendConnectionRequestsController = (supabase) => {
 
                 // Update profile status based on result
                 if (result.success) {
+                  // Any successful request should be marked as pending
+                  const status = result.status === 'connected' ? 'connected' : 'pending';
+
                   // Update profile status
                   await supabase
                     .from('scraped_profiles')
                     .update({
-                      connection_status: result.status,
+                      connection_status: status,
                       last_connection_attempt: new Date().toISOString(),
                       connection_error: null
                     })
@@ -236,19 +262,20 @@ const sendConnectionRequestsController = (supabase) => {
                       campaign_id: campaignId,
                       attempts: (attempts?.attempts || 0) + 1,
                       last_attempt: new Date().toISOString(),
-                      status: result.status,
+                      status: status,
                       error: null
                     });
 
-                  if (result.status === 'pending') {
+                  // Update counters
+                  if (status === 'pending') {
                     sentCount++;
-                  } else if (result.status === 'connected') {
+                  } else if (status === 'connected') {
                     connectedCount++;
-                  } else if (result.status === 'following') {
-                    followingCount++;
                   }
+
+                  processedCount++;
                 } else {
-                  // Update profile with error
+                  // Handle failed requests
                   await supabase
                     .from('scraped_profiles')
                     .update({
@@ -271,9 +298,9 @@ const sendConnectionRequestsController = (supabase) => {
                     });
 
                   failedCount++;
+                  processedCount++;
                 }
 
-                processedCount++;
                 await new Promise(resolve => setTimeout(resolve, delayBetweenProfiles));
               } catch (error) {
                 logger.error(`Error processing profile ${profile.id}: ${error.message}`);
@@ -304,9 +331,7 @@ const sendConnectionRequestsController = (supabase) => {
           const message = `Connection requests completed for campaign ${campaignId}:\n` +
             `✅ Total Processed: ${processedCount}\n` +
             `📤 New Sent: ${sentCount}\n` +
-            `⏳ Already Pending: ${pendingCount}\n` +
             `✅ Already Connected: ${connectedCount}\n` +
-            `👥 Following: ${followingCount}\n` +
             `❌ Failed: ${failedCount}`;
 
           await sendJobStatusReport(
@@ -333,9 +358,7 @@ const sendConnectionRequestsController = (supabase) => {
           }, null, {
             batchSize,
             maxProfiles,
-            pendingCount,
-            connectedCount,
-            followingCount
+            connectedCount
           });
 
           // Update daily connection tracking
@@ -343,10 +366,18 @@ const sendConnectionRequestsController = (supabase) => {
 
           return { success: true };
         } catch (error) {
-          // Check for resistance in any uncaught errors
+          // Check for resistance
           await resistanceHandler.handleResistance(campaignId, error.message);
+          
           logger.error(`Error processing connection requests job ${job.id}: ${error.message}`);
           
+          // Log failed activity
+          await logActivity(supabase, campaignId, 'connection_request', 'failed', 
+            { total: processedCount, successful: sentCount, failed: failedCount },
+            error.message,
+            { jobId: job.id }
+          );
+
           // Send error notification
           await sendJobStatusReport(
             job.id,
@@ -354,20 +385,13 @@ const sendConnectionRequestsController = (supabase) => {
             'failed',
             {
               campaignId,
-              campaignName: campaignData?.name,
+              campaignName: campaignData?.name || 'Unknown Campaign',
               message: `❌ Connection requests failed for campaign ${campaignId}:\n${error.message}`,
               savedCount: sentCount,
               totalScraped: processedCount,
               totalValid: processedCount - failedCount,
               error: error.message
             }
-          );
-
-          // Log failed activity
-          await logActivity(supabase, campaignId, 'connection_request', 'failed', 
-            { total: 0, successful: 0, failed: 0 }, 
-            error.message,
-            { jobId: job.id }
           );
 
           throw error;
@@ -388,36 +412,17 @@ const sendConnectionRequestsController = (supabase) => {
             }
           }
         }
-      };
-
-      // Create the job object
-      const job = {
-        id: `connect_${Date.now()}`,
-        type: 'connect',
-        campaignId,
-        maxProfiles,
-        batchSize,
-        delayBetweenBatches,
-        delayBetweenProfiles,
-        sendMessage,
-        supabase
-      };
-
-      // Send immediate response
-      res.json({
-        success: true,
-        message: 'Connection requests job accepted and queued',
-        jobId: job.id
-      });
-
-      // Add the job to the queue after sending response
-      await jobQueueManager.addJob(jobFunction, job);
+      }, job);
 
     } catch (error) {
-      logger.error(`Error in sendConnectionRequestsController: ${error.message}`);
-      // Only send response if headers haven't been sent yet
+      logger.error(`Error in connection request controller: ${error.message}`);
+      
+      // Only send response if headers haven't been sent
       if (!res.headersSent) {
-        res.status(500).json({ success: false, error: error.message });
+        res.status(500).json({
+          success: false,
+          error: error.message
+        });
       }
     }
   };

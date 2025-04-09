@@ -14,16 +14,14 @@ const sendOpenProfileMessagesControllerFactory = require('./controllers/sendOpen
 const checkConnectionRequestsControllerFactory = require('./controllers/checkConnectionRequestsController');
 const sendConnectionMessagesControllerFactory = require('./controllers/sendConnectionMessagesController');
 
+// Import schedulers
+const { checkCookiesForActiveCampaigns } = require('./scheduler/checkCookiesScheduler');
+const { checkAndProcessCampaigns: checkConnections } = require('./scheduler/checkConnectionRequestsScheduler');
+const { checkAndProcessCampaigns: sendConnections } = require('./scheduler/sendConnectionsScheduler');
+const { processMessaging } = require('./scheduler/sendConnectionMessagesScheduler');
+
 // Other necessary imports
 const { initializeBot } = require('./telegramBot');
-// Simply require the scheduler file to execute it and start the cron job
-require('./scheduler/checkCookiesScheduler');
-// Start the connection requests scheduler
-require('./scheduler/sendConnectionsScheduler');
-// Start the check connection requests scheduler
-require('./scheduler/checkConnectionRequestsScheduler');
-// Start the connection messages scheduler
-require('./scheduler/sendConnectionMessagesScheduler');
 const jobQueueManager = require('./utils/jobQueueManager');
 
 const app = express();
@@ -129,6 +127,71 @@ app.post('/api/send-connection-messages', async (req, res, next) => {
     await sendConnectionMessagesController(req, res);
   } catch (error) {
     next(error);
+  }
+});
+
+// New endpoint for triggering schedulers manually
+app.post('/api/trigger-scheduler', async (req, res) => {
+  const { scheduler } = req.body;
+  const logger = createLogger();
+
+  if (!scheduler) {
+    return res.status(400).json({
+      success: false,
+      error: 'Scheduler name is required'
+    });
+  }
+
+  try {
+    switch (scheduler) {
+      case 'check-cookies':
+        logger.info('Manually triggering cookie check scheduler');
+        // Send response first
+        res.json({
+          success: true,
+          message: `Triggered ${scheduler} scheduler`
+        });
+        await checkCookiesForActiveCampaigns();
+        break;
+      case 'check-connections':
+        logger.info('Manually triggering connection check scheduler');
+        res.json({
+          success: true,
+          message: `Triggered ${scheduler} scheduler`
+        });
+        await checkConnections();
+        break;
+      case 'send-connections':
+        logger.info('Manually triggering connection send scheduler');
+        res.json({
+          success: true,
+          message: `Triggered ${scheduler} scheduler`
+        });
+        await sendConnections();
+        break;
+      case 'send-messages':
+        logger.info('Manually triggering message send scheduler');
+        res.json({
+          success: true,
+          message: `Triggered ${scheduler} scheduler`
+        });
+        await processMessaging();
+        break;
+      default:
+        return res.status(400).json({
+          success: false,
+          error: `Unknown scheduler: ${scheduler}`
+        });
+    }
+  } catch (error) {
+    // Only send error response if we haven't sent a response yet
+    if (!res.headersSent) {
+      logger.error(`Error triggering ${scheduler} scheduler: ${error.message}`);
+      res.status(500).json({
+        success: false,
+        error: error.message
+      });
+    }
   }
 });
 

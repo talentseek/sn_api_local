@@ -3,7 +3,7 @@ const { withTimeout } = require('../utils/databaseUtils');
 const checkConnectionRequestsModule = require('../modules/checkConnectionRequests');
 const { bot, sendJobStatusReport } = require('../telegramBot');
 const jobQueueManager = require('../utils/jobQueueManager');
-const { logActivity } = require('../utils/activityLogger');
+const logActivity = require('../utils/activityLogger');
 
 const logger = createLogger();
 
@@ -17,6 +17,7 @@ const processJob = async (currentJobId, supabase) => {
   let connectionChecker = null;
   let page = null;
   let browser = null;
+  let campaignId = null;  // Declare campaignId in outer scope
 
   try {
     // Get job details
@@ -32,7 +33,10 @@ const processJob = async (currentJobId, supabase) => {
 
     if (jobError) throw new Error(`Failed to fetch job: ${jobError.message}`);
     
-    const campaignId = job.campaign_id;
+    campaignId = parseInt(job.campaign_id, 10);  // Convert to number
+    if (isNaN(campaignId)) {
+      throw new Error(`Invalid campaign ID format: ${job.campaign_id}`);
+    }
     
     // Log activity start
     await logActivity(supabase, campaignId, 'connection_check', 'running', 
@@ -486,50 +490,37 @@ const processJob = async (currentJobId, supabase) => {
   } catch (error) {
     logger.error(`Job ${currentJobId} failed: ${error.message}`);
 
-    // Log failed activity
-    await logActivity(supabase, campaignId, 'connection_check', 'failed', 
-      { total: 0, successful: 0, failed: 0 },
-      error.message,
-      { startTime }
-    );
+    if (campaignId) {  // Only log activity if we have the campaignId
+      // Log failed activity
+      await logActivity(supabase, campaignId, 'connection_check', 'failed', 
+        { total: 0, successful: 0, failed: 0 },
+        error.message,
+        { startTime }
+      );
 
-    // Update job status to failed
-    await withTimeout(
-      supabase
-        .from('jobs')
-        .update({
-          status: 'failed',
-          error: error.message,
-          error_category: 'unknown',
-          updated_at: new Date().toISOString(),
-        })
-        .eq('job_id', currentJobId),
-      10000,
-      'Timeout while updating job status'
-    );
+      // Update job status to failed
+      await withTimeout(
+        supabase
+          .from('jobs')
+          .update({
+            status: 'failed',
+            error: error.message,
+            error_category: 'unknown',
+            updated_at: new Date().toISOString(),
+          })
+          .eq('job_id', currentJobId),
+        10000,
+        'Timeout while updating job status'
+      );
 
-    // Send Telegram notification
-    await bot.sendMessage(
-      process.env.TELEGRAM_NOTIFICATION_CHAT_ID,
-      `❌ Connection request check failed for campaign ${campaignId}: ${error.message}`
-    );
+      // Send Telegram notification
+      await bot.sendMessage(
+        process.env.TELEGRAM_NOTIFICATION_CHAT_ID,
+        `❌ Connection request check failed for campaign ${campaignId}: ${error.message}`
+      );
+    }
 
-    // Send job completion report
-    await sendJobStatusReport(
-      currentJobId,
-      'check',
-      'failed',
-      {
-        campaignId,
-        campaignName: campaignNameData?.name,
-        message: `❌ Connection checks failed for campaign ${campaignId}:\n${error.message}`,
-        totalChecked: totalProfiles || 0,
-        acceptedCount: profilesAccepted || 0,
-        movedToLeadsCount: profilesMovedToLeads || 0,
-        failedCount: failedChecks.length || 0,
-        error: error.message
-      }
-    );
+    throw error;
   } finally {
     try {
       if (connectionChecker) {

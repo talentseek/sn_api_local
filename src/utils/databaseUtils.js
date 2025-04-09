@@ -326,33 +326,34 @@ const updateScrapedProfile = async (supabase, profileId, status) => {
 };
 
 /**
- * Updates the daily connection count for a campaign with proper validation
+ * Updates the daily connection count for a campaign with proper validation and race condition handling
  * @param {string|number} campaignId - Campaign ID
  * @param {number} connectionsToAdd - Number of connections to add
  * @returns {Promise<Object>} Updated record
  */
-const updateDailyConnectionCount = async (campaignId, connectionsToAdd = 0) => {
+const updateDailyConnectionCount = async (supabase, campaignId, connectionsToAdd = 0) => {
   const logger = createLogger();
   
   // Input validation
-  if (!campaignId) throw new Error('Campaign ID is required');
+  if (!campaignId) {
+    throw new Error('Campaign ID is required');
+  }
   
   // Ensure campaignId is a number
   const campaignIdNum = parseInt(campaignId, 10);
   if (isNaN(campaignIdNum)) {
-    throw new Error('Invalid campaign ID format');
+    throw new Error(`Invalid campaign ID format: ${campaignId}`);
   }
   
   // Validate connectionsToAdd
   if (typeof connectionsToAdd !== 'number' || connectionsToAdd < 0) {
-    logger.warn(`Invalid connectionsToAdd value for campaign ${campaignId}: ${connectionsToAdd}`);
-    connectionsToAdd = 0;
+    throw new Error(`Invalid connectionsToAdd value: ${connectionsToAdd}. Must be a non-negative number.`);
   }
 
   const today = new Date().toISOString().split('T')[0];
   
   try {
-    // Use upsert to handle both insert and update cases
+    // Use upsert with atomic update to handle race conditions
     const { data, error } = await withTimeout(
       supabase
         .from('daily_connection_tracking')
@@ -366,8 +367,11 @@ const updateDailyConnectionCount = async (campaignId, connectionsToAdd = 0) => {
           },
           {
             onConflict: 'campaign_id,date',
-            target: ['connections_sent'],
-            update: `connections_sent = COALESCE(daily_connection_tracking.connections_sent, 0) + EXCLUDED.connections_sent`
+            target: ['connections_sent', 'updated_at'],
+            update: `
+              connections_sent = COALESCE(daily_connection_tracking.connections_sent, 0) + EXCLUDED.connections_sent,
+              updated_at = EXCLUDED.updated_at
+            `
           }
         )
         .select()
@@ -376,13 +380,20 @@ const updateDailyConnectionCount = async (campaignId, connectionsToAdd = 0) => {
       'Timeout while updating daily connection count'
     );
 
-    if (error) throw error;
+    if (error) {
+      logger.error(`Database error updating daily connection count: ${error.message}`);
+      throw error;
+    }
 
-    logger.info(`Updated daily connection count for campaign ${campaignIdNum}: ${data.connections_sent}`);
+    if (!data) {
+      throw new Error('No data returned from daily connection count update');
+    }
+
+    logger.info(`Successfully updated daily connection count for campaign ${campaignIdNum}: added ${connectionsToAdd}, new total: ${data.connections_sent}`);
     return data;
   } catch (error) {
     logger.error(`Failed to update daily connection count for campaign ${campaignIdNum}: ${error.message}`);
-    throw error;
+    throw new Error(`Failed to update daily connection count: ${error.message}`);
   }
 };
 

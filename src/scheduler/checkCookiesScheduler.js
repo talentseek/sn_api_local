@@ -119,8 +119,11 @@ const scheduleTask = () => {
   });
 };
 
+// Export the main function for manual triggering
+module.exports = {
+  checkCookiesForActiveCampaigns
+};
+
 // Start the scheduler
 logger.info('Starting cookie check scheduler...');
 scheduleTask();
-
-module.exports = { checkCookiesForActiveCampaigns };

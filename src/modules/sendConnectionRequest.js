@@ -162,9 +162,7 @@ const sendConnectionRequest = (page) => {
         
         logger.info('Connection request modal appeared and is interactive');
       } catch (error) {
-        logger.error(`Modal did not appear after clicking Connect: ${error.message}`);
-        
-        // Check if the connection request was already sent
+        // Check if the connection request was already sent before logging any error
         const connectionStatus = await page.evaluate(() => {
           const buttons = Array.from(document.querySelectorAll('button'));
           const buttonTexts = buttons.map(button => button.textContent.trim());
@@ -174,7 +172,6 @@ const sendConnectionRequest = (page) => {
           if (buttonTexts.some(text => text.includes('Message sent'))) return 'pending';
           if (buttonTexts.some(text => text.includes('Message'))) return 'pending';
           if (buttonTexts.some(text => text.includes('Connected'))) return 'connected';
-          if (buttonTexts.some(text => text.includes('Following'))) return 'following';
           
           return 'not_connected';
         });
@@ -184,6 +181,8 @@ const sendConnectionRequest = (page) => {
           return { success: true, status: connectionStatus };
         }
 
+        // Only log error if we're not in a known good state
+        logger.error(`Modal did not appear after clicking Connect: ${error.message}`);
         throw new Error('Failed to open connection request modal');
       }
 

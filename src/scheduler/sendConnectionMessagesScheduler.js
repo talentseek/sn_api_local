@@ -234,12 +234,6 @@ async function processMessageStage(campaign, messageStage) {
     return;
   }
 
-  // Validate message templates first
-  if (!await validateMessageTemplates(campaign)) {
-    logger.warn(`Skipping campaign ${campaign.id} due to invalid message templates`);
-    return;
-  }
-
   // Check daily limit
   const dailyCount = await getDailyMessageCount(campaign.id, messageStage.stage);
   if (dailyCount >= messageStage.maxPerDay) {
@@ -250,93 +244,39 @@ async function processMessageStage(campaign, messageStage) {
   const remainingDaily = messageStage.maxPerDay - dailyCount;
   const batchSize = Math.min(5, remainingDaily); // Process up to 5 at a time
 
-  const activityLogId = await logActivity(campaign.id, messageStage.stage, 'running');
+  logger.info(`Processing stage ${messageStage.stage} for campaign ${campaign.id} - eligible leads found`);
   
   try {
-    // Get leads with their last_contacted dates, ordered by connection date
-    const { data: leads, error: leadsError } = await supabase
-      .from('leads')
-      .select('id, message_stage, last_contacted, connected_at')
-      .eq('campaign_id', campaign.id)
-      .eq('connection_level', '1st')
-      .eq('status', 'not_replied')
-      .order('connected_at', { ascending: true })
-      .limit(100);
-
-    if (leadsError) {
-      throw new Error(`Failed to fetch leads: ${leadsError.message}`);
-    }
-
-    // Filter eligible leads based on stage and delay
-    const eligibleLeads = leads.filter(lead => {
-      if (messageStage.stage === 1) {
-        return lead.message_stage === null;
-      } else {
-        return (
-          lead.message_stage === messageStage.stage - 1 &&
-          hasDelayPassed(lead.last_contacted, messageStage.delay_days)
-        );
-      }
-    });
-
-    if (eligibleLeads.length === 0) {
-      logger.info(`No eligible leads found for campaign ${campaign.id} stage ${messageStage.stage}`);
-      return;
-    }
-
-    // Send message request
+    // Send message request to the controller
     const response = await fetch('http://localhost:8080/api/send-connection-messages', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         campaignId: campaign.id,
         messageStage: messageStage.stage,
-        batchSize: batchSize,
-        delayDays: messageStage.delay_days,
-        leadIds: eligibleLeads.slice(0, batchSize).map(l => l.id)
+        batchSize: batchSize
       })
     });
 
     const result = await response.json();
 
     if (!result.success) {
-      if (result.error) {
-        const resistanceResult = await resistanceHandler.handleResistance(campaign.id, result.error);
-        if (resistanceResult) {
-          logger.warn(`LinkedIn resistance detected (${resistanceResult.resistanceType}). Campaign ${campaign.id} in cooldown until ${resistanceResult.cooldownUntil}`);
-        }
-      }
       throw new Error(result.error || 'Failed to send messages');
     }
-
-    // Log success
-    await logActivity(campaign.id, messageStage.stage, 'success', {
-      total: result.totalProcessed || 0,
-      successful: result.successfulMessages || 0,
-      failed: result.failedMessages || 0
-    }, null, {
-      remainingDaily: remainingDaily - (result.successfulMessages || 0),
-      skippedResponded: result.skippedResponded || 0
-    });
 
     return result.successfulMessages || 0;
 
   } catch (error) {
     logger.error(`Error sending ${messageStage.description} for campaign ${campaign.id}: ${error.message}`);
     
-    await logActivity(campaign.id, messageStage.stage, 'failed', 
-      { total: 0, successful: 0, failed: 0 }, 
-      error.message
-    );
-
-    // Implement retry mechanism for non-resistance errors
+    // Check for resistance in any uncaught errors
     if (!error.message.toLowerCase().includes('resistance') && 
         !error.message.toLowerCase().includes('captcha')) {
       logger.info(`Scheduling retry for campaign ${campaign.id} in 5 minutes`);
       setTimeout(() => processMessageStage(campaign, messageStage), 5 * 60 * 1000);
     }
 
-    return 0;
+    throw error;
   }
 }
 
@@ -442,16 +382,13 @@ async function processMessaging() {
   }
 }
 
+// Export the main function for manual triggering
+module.exports = {
+  processMessaging
+};
+
 // Schedule the task to run every hour
 logger.info('Starting connection messaging scheduler...');
 cron.schedule('0 * * * *', async () => {
   await processMessaging();
-});
-
-// Export for testing
-module.exports = {
-  processMessaging,
-  processMessageStage,
-  MESSAGE_STAGES,
-  SCHEDULE_WINDOWS
-}; 
+}); 
